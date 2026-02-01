@@ -2,26 +2,36 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
-// You can use print statements as follows for debugging, they'll be visible when running tests.
-Console.WriteLine("Logs from your program will appear here!");
 
+await MainAsync();
 
-TcpListener server = new TcpListener(IPAddress.Any, 6379);
-server.Start();
-
-while (true)
+static async Task MainAsync()
 {
-  Socket client = server.AcceptSocket(); // wait for client
-
-  byte[] buffer = new byte[1024];
-
-  while (client.Connected)
+  TcpListener server = new TcpListener(IPAddress.Any, 6379);
+  server.Start();
+  while (true)
   {
-    int bytesRead = client.Receive(buffer);
-    if (bytesRead == 0)
-      break;
-
-    client.Send(Encoding.UTF8.GetBytes("+PONG\r\n"));
+    var client = await server.AcceptTcpClientAsync();
+    _ = HandleClientAsync(client, CancellationToken.None);
   }
-  client.Close();
+}
+static async Task HandleClientAsync(TcpClient client, CancellationToken ct) {
+  using var _ = client;
+  var stream = client.GetStream();
+  var buffer = new byte[1024];
+  try
+  {
+    while (true)
+    {
+      int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+      if (bytesRead <= 0)
+        return;
+      byte[] pong = Encoding.UTF8.GetBytes("+PONG\r\n");
+      await stream.WriteAsync(pong, 0, pong.Length, ct);
+    }
+  }
+  catch
+  {
+
+  }
 }
