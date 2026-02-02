@@ -68,6 +68,7 @@ static byte[] ProcessCommand(
   {
     "PING" => HandlePing(),
     "ECHO" when command.Length > 1 => HandleEcho(command[1]),
+    "LPOP" when command.Length == 2 => HandleLPop(command, lists),
     "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
@@ -154,6 +155,22 @@ static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<st
     }
     return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
   }
+}
+
+static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<string>> lists)
+{
+  string key = command[1];
+
+  if (!lists.TryGetValue(key, out var list) || list.Count == 0)
+  {
+    return Encoding.UTF8.GetBytes($"-1\r\n");
+  }
+
+  var value = list[0];
+
+  list.Remove(value);
+
+  return Encoding.UTF8.GetBytes($"${value.Length}\r\n{value}\r\n");
 }
 
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
