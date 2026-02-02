@@ -1,7 +1,6 @@
-using System.Diagnostics.CodeAnalysis;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Text;
 
 
@@ -9,15 +8,17 @@ await MainAsync();
 
 static async Task MainAsync()
 {
+  var storage = new ConcurrentDictionary<string, string>();
+
   TcpListener server = new TcpListener(IPAddress.Any, 6379);
   server.Start();
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
-    _ = HandleClientAsync(client, CancellationToken.None);
+    _ = HandleClientAsync(client, storage, CancellationToken.None);
   }
 }
-static async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+static async Task HandleClientAsync(TcpClient client, ConcurrentDictionary<string, string> storage, CancellationToken ct)
 {
   using var _ = client;
   var stream = client.GetStream();
@@ -42,7 +43,29 @@ static async Task HandleClientAsync(TcpClient client, CancellationToken ct)
       else if (command.Length > 1 && command[0].Equals("ECHO", StringComparison.OrdinalIgnoreCase))
       {
         string message = command[1];
+
         response = Encoding.UTF8.GetBytes($"${message.Length}\r\n{message}\r\n");
+      }
+      else if (command.Length >= 3 && command[0].Equals("SET", StringComparison.OrdinalIgnoreCase))
+      {
+        string key = command[1];
+        string value = command[2];
+        storage[key] = value;
+
+        response = Encoding.UTF8.GetBytes("+OK\r\n");
+      }
+      else if (command.Length >= 2 && command[0].Equals("GET", StringComparison.OrdinalIgnoreCase))
+      {
+        string key = command[1];
+
+        if (storage.TryGetValue(key, out string? value))
+        {
+          response = Encoding.UTF8.GetBytes($"${value.Length}\r\n{value}\r\n");
+        }
+        else
+        {
+          response = Encoding.UTF8.GetBytes("$-1\r\n");
+        }
       }
       else
       {
