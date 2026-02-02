@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection.Metadata.Ecma335;
 using System.Text;
+using System.Threading.Tasks.Sources;
 
 await MainAsync();
 
@@ -69,6 +70,7 @@ static byte[] ProcessCommand(
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists),
+    "LPUSH" when command.Length >= 3 => HandleLPush(command, lists),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
@@ -132,6 +134,21 @@ static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<st
     for (int i = 2; i < command.Length; i++)
     {
       list.Add(command[i]);
+    }
+    return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
+  }
+}
+
+static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<string>> lists)
+{
+  string key = command[1];
+  var list = lists.GetOrAdd(key, _ => new List<string>());
+
+  lock (list)
+  {
+    for (int i = 2; i < command.Length; i++)
+    {
+      list.Insert(0, command[i]);
     }
     return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
   }
