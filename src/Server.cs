@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection.Metadata.Ecma335;
 using System.Text;
 
 await MainAsync();
@@ -138,24 +140,34 @@ static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<st
 static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
-  
+
   if (!int.TryParse(command[2], out int start) || !int.TryParse(command[3], out int stop))
+  {
     return Encoding.UTF8.GetBytes("*0\r\n");
+  }
 
   if (!lists.TryGetValue(key, out var list))
+  {
     return Encoding.UTF8.GetBytes("*0\r\n");
+  }
 
   lock (list)
   {
-    // Handle edge cases
-    if (start >= list.Count || start > stop)
+    int length = list.Count;
+
+    if (start < 0)
+      start = Math.Max(0, length + start);
+
+    if (stop < 0)
+      stop = Math.Max(0, length + stop);
+
+    if (start >= length || start > stop)
       return Encoding.UTF8.GetBytes("*0\r\n");
 
-    // Clamp stop to list length
-    if (stop >= list.Count)
-      stop = list.Count - 1;
+    // clamp stop to list length to avoid out of bounds
+    if (stop >= length)
+      stop = length - 1;
 
-    // Build RESP array
     var result = new StringBuilder();
     int count = stop - start + 1;
     result.Append($"*{count}\r\n");
