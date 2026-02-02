@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,17 +10,18 @@ await MainAsync();
 static async Task MainAsync()
 {
   var storage = new ConcurrentDictionary<string, (string Value, DateTime? Expiry)>();
+  var lists = new ConcurrentDictionary<string, List<string>>();
 
   TcpListener server = new TcpListener(IPAddress.Any, 6379);
   server.Start();
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
-    _ = HandleClientAsync(client, storage, CancellationToken.None);
+    _ = HandleClientAsync(client, storage, lists, CancellationToken.None);
   }
 }
 
-static async Task HandleClientAsync(TcpClient client, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, CancellationToken ct)
+static async Task HandleClientAsync(TcpClient client, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, ConcurrentDictionary<string, List<string>> lists, CancellationToken ct)
 {
   using var _ = client;
   var stream = client.GetStream();
@@ -82,7 +84,7 @@ static async Task HandleClientAsync(TcpClient client, ConcurrentDictionary<strin
           if (entry.Expiry.HasValue && DateTime.UtcNow > entry.Expiry.Value)
           {
             // Remove expired key
-            storage.TryRemove(key, out var _);
+            storage.TryRemove(key, out var removedEntry);
             response = Encoding.UTF8.GetBytes("$-1\r\n");
           }
           else
@@ -93,6 +95,22 @@ static async Task HandleClientAsync(TcpClient client, ConcurrentDictionary<strin
         else
         {
           response = Encoding.UTF8.GetBytes("$-1\r\n");
+        }
+      }
+      else if (command.Length >= 3 && command[0].Equals("RPUSH", StringComparison.OrdinalIgnoreCase))
+      {
+        string key = command[1];
+
+        var list = lists.GetOrAdd(key, _ => new List<string>());
+
+        lock (list)
+        {
+          for (int i = 2; i < command.Length; i++)
+          {
+            list.Add(command[i]);
+          }
+
+          response = Encoding.UTF8.GetBytes($":{list.Count}\r\n");
         }
       }
       else
