@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
+using System.Data.Common;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection.Metadata.Ecma335;
@@ -67,8 +68,9 @@ static byte[] ProcessCommand(
   {
     "PING" => HandlePing(),
     "ECHO" when command.Length > 1 => HandleEcho(command[1]),
-    "SET" when command.Length >= 3 => HandleSet(command, storage),
+    "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
+    "SET" when command.Length >= 3 => HandleSet(command, storage),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -152,6 +154,16 @@ static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<st
     }
     return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
   }
+}
+
+static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
+{
+
+  string key = command[1];
+
+  if (!lists.TryGetValue(key, out var list)) return Encoding.UTF8.GetBytes($":0\r\n");
+
+  return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
 }
 
 static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<string>> lists)
