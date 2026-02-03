@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
+using System.Data;
 using System.Data.Common;
 using System.Net;
 using System.Net.Sockets;
@@ -68,7 +69,7 @@ static byte[] ProcessCommand(
   {
     "PING" => HandlePing(),
     "ECHO" when command.Length > 1 => HandleEcho(command[1]),
-    "LPOP" when command.Length == 2 => HandleLPop(command, lists),
+    "LPOP" when command.Length >= 2 => HandleLPop(command, lists),
     "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
@@ -160,17 +161,53 @@ static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<st
 static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
+  int count = 1;
 
-  if (!lists.TryGetValue(key, out var list) || list.Count == 0)
+  if (!lists.TryGetValue(key, out var list))
   {
-    return Encoding.UTF8.GetBytes($"-1\r\n");
+    return Encoding.UTF8.GetBytes("$-1\r\n");
   }
 
-  var value = list[0];
+  if (command.Length >= 3 && int.TryParse(command[2], out int parsedCount))
+  {
+    count = parsedCount;
+  }
 
-  list.Remove(value);
+  lock (list)
+  {
 
-  return Encoding.UTF8.GetBytes($"${value.Length}\r\n{value}\r\n");
+    if (list.Count == 0)
+    {
+      return Encoding.UTF8.GetBytes("$-1\r\n");
+    }
+    if (count == 1)
+    {
+      var value = list[0];
+      list.RemoveAt(0);
+      return Encoding.UTF8.GetBytes($"${value.Length}\r\n{value}\r\n");
+    }
+
+    int actualCount = Math.Min(count, list.Count);
+    var removed = new List<string>();
+
+    for (int i = 0; i < actualCount; i++)
+    {
+      removed.Add(list[0]);
+      list.RemoveAt(0);
+    }
+
+    var result = new StringBuilder();
+    result.Append($"*{removed.Count}\r\n");
+
+    foreach (var element in removed)
+    {
+      result.Append($"${element.Length}\r\n{element}\r\n");
+    }
+
+    return Encoding.UTF8.GetBytes(result.ToString());
+
+  }
+
 }
 
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
