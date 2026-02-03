@@ -1,12 +1,7 @@
 using System.Collections.Concurrent;
-using System.ComponentModel;
-using System.Data;
-using System.Data.Common;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection.Metadata.Ecma335;
 using System.Text;
-using System.Threading.Tasks.Sources;
 
 await MainAsync();
 
@@ -14,6 +9,7 @@ static async Task MainAsync()
 {
   var storage = new ConcurrentDictionary<string, (string Value, DateTime? Expiry)>();
   var lists = new ConcurrentDictionary<string, List<string>>();
+  var listWaiters = new ConcurrentDictionary<string, List<TaskCompletionSource<string?>>>();
 
   TcpListener server = new TcpListener(IPAddress.Any, 6379);
   server.Start();
@@ -21,14 +17,15 @@ static async Task MainAsync()
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
-    _ = HandleClientAsync(client, storage, lists, CancellationToken.None);
+    _ = HandleClientAsync(client, storage, lists, listWaiters, CancellationToken.None);
   }
 }
 
 static async Task HandleClientAsync(
-  TcpClient client, 
-  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
-  ConcurrentDictionary<string, List<string>> lists, 
+  TcpClient client,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
   CancellationToken ct)
 {
   using var _ = client;
@@ -45,7 +42,7 @@ static async Task HandleClientAsync(
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       var command = ParseRespArray(request);
       
-      byte[] response = ProcessCommand(command, storage, lists);
+      byte[] response = await ProcessCommand(command, storage, lists, listWaiters);
       await stream.WriteAsync(response, 0, response.Length, ct);
     }
   }
@@ -55,10 +52,11 @@ static async Task HandleClientAsync(
   }
 }
 
-static byte[] ProcessCommand(
+static async Task<byte[]> ProcessCommand(
   string[] command, 
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
-  ConcurrentDictionary<string, List<string>> lists)
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   if (command.Length == 0)
     return Encoding.UTF8.GetBytes("+PONG\r\n");
@@ -73,9 +71,10 @@ static byte[] ProcessCommand(
     "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
-    "RPUSH" when command.Length >= 3 => HandleRPush(command, lists),
-    "LPUSH" when command.Length >= 3 => HandleLPush(command, lists),
+    "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
+    "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
+    "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -128,36 +127,45 @@ static byte[] HandleGet(string key, ConcurrentDictionary<string, (string Value, 
   return Encoding.UTF8.GetBytes($"${entry.Value.Length}\r\n{entry.Value}\r\n");
 }
 
-static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists)
+static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   string key = command[1];
   var list = lists.GetOrAdd(key, _ => new List<string>());
 
+  int count;
   lock (list)
   {
     for (int i = 2; i < command.Length; i++)
     {
       list.Add(command[i]);
     }
-    return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
+    count = list.Count;
   }
+
+  NotifyWaiters(key, lists, listWaiters);
+
+  return Encoding.UTF8.GetBytes($":{count}\r\n");
 }
 
-static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<string>> lists)
+static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   string key = command[1];
   var list = lists.GetOrAdd(key, _ => new List<string>());
 
+  int count;
   lock (list)
   {
     for (int i = 2; i < command.Length; i++)
     {
       list.Insert(0, command[i]);
     }
-    return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
+    count = list.Count;
   }
-}
 
+  NotifyWaiters(key, lists, listWaiters);
+
+  return Encoding.UTF8.GetBytes($":{count}\r\n");
+}
 static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -175,11 +183,11 @@ static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<str
 
   lock (list)
   {
-
     if (list.Count == 0)
     {
       return Encoding.UTF8.GetBytes("$-1\r\n");
     }
+    
     if (count == 1)
     {
       var value = list[0];
@@ -205,17 +213,101 @@ static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<str
     }
 
     return Encoding.UTF8.GetBytes(result.ToString());
+  }
+}
 
+static async Task<byte[]> HandleBLPopAsync(
+  string[] command, 
+  ConcurrentDictionary<string, List<string>> lists, 
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
+{
+  string key = command[1];
+  double timeout = 0;
+
+  if (command.Length >= 3 && double.TryParse(command[command.Length - 1], out double parsedTimeout))
+  {
+    timeout = parsedTimeout;
   }
 
+  while (true)
+  {
+    if (lists.TryGetValue(key, out var list))
+    {
+      lock (list)
+      {
+        if (list.Count > 0)
+        {
+          var value = list[0];
+          list.RemoveAt(0);
+
+          var result = new StringBuilder();
+          result.Append("*2\r\n");
+          result.Append($"${key.Length}\r\n{key}\r\n");
+          result.Append($"${value.Length}\r\n{value}\r\n");
+
+          return Encoding.UTF8.GetBytes(result.ToString());
+        }
+      }
+    }
+
+    var tcs = new TaskCompletionSource<string?>();
+    var waiters = listWaiters.GetOrAdd(key, _ => new List<TaskCompletionSource<string?>>());
+
+    lock (waiters)
+    {
+      waiters.Add(tcs);
+    }
+
+    if (timeout > 0)
+    {
+      var timeoutTask = Task.Delay(TimeSpan.FromSeconds(timeout));
+      var completedTask = await Task.WhenAny(tcs.Task, timeoutTask);
+
+      if (completedTask == timeoutTask)
+      {
+        lock (waiters)
+        {
+          waiters.Remove(tcs);
+        }
+        return Encoding.UTF8.GetBytes("$-1\r\n");
+      }
+    }
+    else
+    {
+      await tcs.Task;
+    }
+  }
+}
+
+static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
+{
+  if (!listWaiters.TryGetValue(key, out var waiters))
+    return;
+
+  lock (waiters)
+  {
+    if (!lists.TryGetValue(key, out var list))
+      return;
+
+    lock (list)
+    {
+      // Notify one waiter per available element
+      while (waiters.Count > 0 && list.Count > 0)
+      {
+        var waiter = waiters[0];
+        waiters.RemoveAt(0);
+        waiter.TrySetResult(key);
+      }
+    }
+  }
 }
 
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
-
   string key = command[1];
 
-  if (!lists.TryGetValue(key, out var list)) return Encoding.UTF8.GetBytes($":0\r\n");
+  if (!lists.TryGetValue(key, out var list)) 
+    return Encoding.UTF8.GetBytes(":0\r\n");
 
   return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
 }
@@ -247,7 +339,6 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
     if (start >= length || start > stop)
       return Encoding.UTF8.GetBytes("*0\r\n");
 
-    // clamp stop to list length to avoid out of bounds
     if (stop >= length)
       stop = length - 1;
 
