@@ -75,6 +75,7 @@ static async Task<byte[]> ProcessCommand(
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
     "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
+    "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -354,6 +355,31 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
 
     return Encoding.UTF8.GetBytes(result.ToString());
   }
+}
+
+static byte[] HandleGetType(
+  string[] command,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists)
+{
+  string key = command[1];
+
+  if (storage.TryGetValue(key, out var entry))
+  {
+    if (entry.Expiry.HasValue && DateTime.UtcNow > entry.Expiry.Value)
+    {
+      return Encoding.UTF8.GetBytes("+none\r\n");
+    }
+    return Encoding.UTF8.GetBytes($"+{entry.Value.GetType().Name.ToLower()}\r\n");
+  }
+
+  if (!lists.TryGetValue(key, out var value))
+  {
+    return Encoding.UTF8.GetBytes("+none\r\n");
+  }
+
+
+  return Encoding.UTF8.GetBytes($"+{value.GetType().Name.ToLower()}");
 }
 
 static string[] ParseRespArray(string input)
