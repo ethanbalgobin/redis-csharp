@@ -269,7 +269,7 @@ static async Task<byte[]> HandleBLPopAsync(
         {
           waiters.Remove(tcs);
         }
-        return Encoding.UTF8.GetBytes("$-1\r\n");
+        return Encoding.UTF8.GetBytes("*-1\r\n");
       }
     }
     else
