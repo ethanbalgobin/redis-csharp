@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -371,27 +372,54 @@ static byte[] HandleXAdd(
   string key = command[1];
   string id = command[2];
 
+  // handle auto generation of seq number
+  if (id.Contains("-*"))
+  {
+    var parts = id.Split('-');
+    string timePart = parts[0];
+
+    var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
+
+    lock (stream)
+    {
+      long sequenceNumber = GenerateSequenceNumber(stream, timePart);
+      id = $"{timePart}-{sequenceNumber}";
+
+      var fields = new Dictionary<string, string>();
+      for (int i = 3; i < command.Length; i += 2)
+      {
+        if (i + 1 < command.Length)
+        {
+          fields[command[i]] = command[i + 1];
+        }
+      }
+
+      stream.Add((id, fields));
+      return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
+    }
+  }
+
   if (id == "0-0")
   {
     return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD must be greater than 0-0\r\n");
   }
 
-  var fields = new Dictionary<string, string>();
+  var fieldsDict = new Dictionary<string, string>();
   for (int i = 3; i < command.Length; i += 2)
   {
     if (i + 1 < command.Length)
     {
-      fields[command[i]] = command[i + 1];
+      fieldsDict[command[i]] = command[i + 1];
     }
   }
 
-  var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
+  var streamData = streams.GetOrAdd(key, _ => new List<(String, Dictionary<string, string>)>());
 
-  lock (stream)
+  lock (streamData)
   {
-    if (stream.Count > 0)
+    if (streamData.Count > 0)
     {
-      string lastId = stream[stream.Count - 1].Id;
+      string lastId = streamData[streamData.Count - 1].Id;
 
       if (CompareStreamIds(id, lastId) <= 0)
       {
@@ -402,14 +430,38 @@ static byte[] HandleXAdd(
     {
       if (CompareStreamIds(id, "0-0") <= 0)
       {
-        return Encoding.UTF8.GetBytes("-ERR The specified ID in XADD must be greater than 0-0\r\n");
+        return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD must be greater than 0-0\r\n");
       }
     }
 
-    stream.Add((id, fields));
+    streamData.Add((id, fieldsDict));
 
     return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
   }
+}
+
+static long GenerateSequenceNumber(List<(string Id, Dictionary<string, string> Fields)> stream, string timePart)
+{
+  if (timePart == "0")
+    return 1;
+
+  for (int i = stream.Count - 1; i > -0; i--) // find last entry with same time part
+  {
+    var (ms, seq) = ParseStreamId(stream[i].Id);
+
+    if (ms.ToString() == timePart)
+    {
+      return seq + 1; // entry with the same time
+    }
+
+    if (ms < long.Parse(timePart))
+    {
+      break; // surpassed entryies with current time part
+    }
+  }
+
+  return 0; // no entries with time part exist, so start at 0
+
 }
 
 static (long milliseconds, long sequence) ParseStreamId(string id)
