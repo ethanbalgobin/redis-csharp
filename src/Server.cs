@@ -371,6 +371,11 @@ static byte[] HandleXAdd(
   string key = command[1];
   string id = command[2];
 
+  if (id == "0-0")
+  {
+    return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD must be greater than 0-0\r\n");
+  }
+
   var fields = new Dictionary<string, string>();
   for (int i = 3; i < command.Length; i += 2)
   {
@@ -384,10 +389,51 @@ static byte[] HandleXAdd(
 
   lock (stream)
   {
-    stream.Add((id, fields));
-  }
+    if (stream.Count > 0)
+    {
+      string lastId = stream[stream.Count - 1].Id;
 
-  return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
+      if (CompareStreamIds(id, lastId) <= 0)
+      {
+        return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+      }
+    }
+    else
+    {
+      if (CompareStreamIds(id, "0-0") <= 0)
+      {
+        return Encoding.UTF8.GetBytes("-ERR The specified ID in XADD must be greater than 0-0\r\n");
+      }
+    }
+
+    stream.Add((id, fields));
+
+    return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
+  }
+}
+
+static (long milliseconds, long sequence) ParseStreamId(string id)
+{
+  var parts = id.Split('-');
+  if (parts.Length != 2)
+    return (0, 0);
+
+  long.TryParse(parts[0], out long milliseconds);
+  long.TryParse(parts[1], out long sequence);
+
+  return (milliseconds, sequence);
+}
+
+static int CompareStreamIds(string id1, string id2)
+{
+  var (ms1, seq1) = ParseStreamId(id1);
+  var (ms2, seq2) = ParseStreamId(id2);
+
+  if (ms1 != ms2)
+    return ms1.CompareTo(ms2);
+
+  return seq1.CompareTo(seq2);
+
 }
 
 static byte[] HandleGetType(
