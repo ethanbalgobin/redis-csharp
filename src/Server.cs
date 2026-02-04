@@ -1,9 +1,6 @@
 using System.Collections.Concurrent;
-using System.ComponentModel.DataAnnotations;
-using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
 using System.Text;
 
 await MainAsync();
@@ -372,6 +369,31 @@ static byte[] HandleXAdd(
   string key = command[1];
   string id = command[2];
 
+  // handle fully auto generated id
+  if (id == "*")
+  {
+    var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
+
+    lock (stream)
+    {
+      long currentTime = GetCurrentMilliseconds();
+      long sequenceNumber = GenerateSequenceNumber(stream, currentTime.ToString());
+      id = $"{currentTime}-{sequenceNumber}";
+
+      var fields = new Dictionary<string, string>();
+      for (int i = 3; i < command.Length; i += 2)
+      {
+        if (i + 1 < command.Length)
+        {
+          fields[command[i]] = command[i + 1];
+        }
+      }
+
+      stream.Add((id, fields));
+      return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
+    }
+  }
+
   // handle auto generation of seq number
   if (id.Contains("-*"))
   {
@@ -440,12 +462,17 @@ static byte[] HandleXAdd(
   }
 }
 
+static long GetCurrentMilliseconds()
+{
+  return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+}
+
 static long GenerateSequenceNumber(List<(string Id, Dictionary<string, string> Fields)> stream, string timePart)
 {
   if (timePart == "0")
     return 1;
 
-  for (int i = stream.Count - 1; i > -0; i--) // find last entry with same time part
+  for (int i = stream.Count - 1; i >= 0; i--) // find last entry with same time part
   {
     var (ms, seq) = ParseStreamId(stream[i].Id);
 
@@ -500,9 +527,10 @@ static byte[] HandleGetType(
   {
     if (entry.Expiry.HasValue && DateTime.UtcNow > entry.Expiry.Value)
     {
+      storage.TryRemove(key, out _);
       return Encoding.UTF8.GetBytes("+none\r\n");
     }
-    return Encoding.UTF8.GetBytes($"+{entry.Value.GetType().Name.ToLower()}\r\n");
+    return Encoding.UTF8.GetBytes($"+string\r\n");
   }
 
   if (lists.TryGetValue(key, out _))
