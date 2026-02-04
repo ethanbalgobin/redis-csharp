@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 await MainAsync();
@@ -9,6 +11,7 @@ static async Task MainAsync()
 {
   var storage = new ConcurrentDictionary<string, (string Value, DateTime? Expiry)>();
   var lists = new ConcurrentDictionary<string, List<string>>();
+  var streams = new ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>>();
   var listWaiters = new ConcurrentDictionary<string, List<TaskCompletionSource<string?>>>();
 
   TcpListener server = new TcpListener(IPAddress.Any, 6379);
@@ -17,7 +20,7 @@ static async Task MainAsync()
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
-    _ = HandleClientAsync(client, storage, lists, listWaiters, CancellationToken.None);
+    _ = HandleClientAsync(client, storage, lists, streams, listWaiters, CancellationToken.None);
   }
 }
 
@@ -25,6 +28,7 @@ static async Task HandleClientAsync(
   TcpClient client,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
   CancellationToken ct)
 {
@@ -42,7 +46,7 @@ static async Task HandleClientAsync(
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       var command = ParseRespArray(request);
       
-      byte[] response = await ProcessCommand(command, storage, lists, listWaiters);
+      byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters);
       await stream.WriteAsync(response, 0, response.Length, ct);
     }
   }
@@ -56,6 +60,7 @@ static async Task<byte[]> ProcessCommand(
   string[] command, 
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
   ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   if (command.Length == 0)
@@ -75,7 +80,8 @@ static async Task<byte[]> ProcessCommand(
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
     "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
-    "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists),
+    "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists, streams),
+    "XADD" when command.Length >= 4 => HandleXAdd(command, streams),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -357,10 +363,38 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
   }
 }
 
+static byte[] HandleXAdd(
+  string[] command,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams
+)
+{
+  string key = command[1];
+  string id = command[2];
+
+  var fields = new Dictionary<string, string>();
+  for (int i = 3; i < command.Length; i += 2)
+  {
+    if (i + 1 < command.Length)
+    {
+      fields[command[i]] = command[i + 1];
+    }
+  }
+
+  var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
+
+  lock (stream)
+  {
+    stream.Add((id, fields));
+  }
+
+  return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
+}
+
 static byte[] HandleGetType(
   string[] command,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
-  ConcurrentDictionary<string, List<string>> lists)
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
   string key = command[1];
 
@@ -373,13 +407,18 @@ static byte[] HandleGetType(
     return Encoding.UTF8.GetBytes($"+{entry.Value.GetType().Name.ToLower()}\r\n");
   }
 
-  if (!lists.TryGetValue(key, out var value))
+  if (lists.TryGetValue(key, out _))
   {
-    return Encoding.UTF8.GetBytes("+none\r\n");
+    return Encoding.UTF8.GetBytes("+list\r\n");
   }
 
+  if (streams.TryGetValue(key, out _))
+  {
+    return Encoding.UTF8.GetBytes("+stream\r\n");
+  }
 
-  return Encoding.UTF8.GetBytes($"+{value.GetType().Name.ToLower()}");
+  // key does not exist
+  return Encoding.UTF8.GetBytes("+none\r\n");
 }
 
 static string[] ParseRespArray(string input)
