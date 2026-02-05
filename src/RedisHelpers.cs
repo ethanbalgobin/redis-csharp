@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace RedisServer;
 
 public static class RedisHelpers
@@ -39,7 +41,7 @@ public static class RedisHelpers
   }
 
   public static long GenerateSequenceNumber(
-    List<(string Id, Dictionary<string, string> Fields)> stream, 
+    List<(string Id, Dictionary<string, string> Fields)> stream,
     string timePart)
   {
     if (timePart == "0")
@@ -74,5 +76,49 @@ public static class RedisHelpers
     }
 
     return result.ToArray();
+  }
+
+  public static byte[] BuildXReadResponse(List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)> streamResults)
+  {
+    var result = new System.Text.StringBuilder();
+    result.Append($"*{streamResults.Count}\r\n");
+
+    foreach (var (key, entries) in streamResults)
+    {
+      result.Append("*2\r\n");
+      result.Append($"${key.Length}\r\n{key}\r\n");
+
+      result.Append($"*{entries.Count}\r\n");
+
+      foreach (var (id, fields) in entries)
+      {
+        result.Append("*2\r\n");
+        result.Append($"${id.Length}\r\n{id}\r\n");
+
+        result.Append($"*{fields.Count * 2}\r\n");
+        foreach (var (fieldName, fieldValue) in fields)
+        {
+          result.Append($"${fieldName.Length}\r\n{fieldName}\r\n");
+          result.Append($"${fieldValue.Length}\r\n{fieldValue}\r\n");
+        }
+      }
+    }
+
+    return System.Text.Encoding.UTF8.GetBytes(result.ToString());
+  }
+  
+  public static void NotifyStreamWaiters(string key, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
+  {
+    if (!listWaiters.TryGetValue(key, out var waiters))
+      return;
+
+    lock (waiters)
+    {
+      foreach (var waiter in waiters.ToList())
+      {
+        waiter.TrySetResult(key);
+      }
+      waiters.Clear();
+    }
   }
 }

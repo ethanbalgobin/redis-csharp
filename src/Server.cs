@@ -80,9 +80,9 @@ static async Task<byte[]> ProcessCommand(
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
     "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
     "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists, streams),
-    "XADD" when command.Length >= 4 => HandleXAdd(command, streams),
+    "XADD" when command.Length >= 4 => HandleXAdd(command, streams, listWaiters),
     "XRANGE" when command.Length >= 4 => HandleXRange(command, streams),
-    "XREAD" when command.Length >= 4 => HandleXRead(command, streams),
+    "XREAD" when command.Length >= 4 => await HandleXReadAsync(command, streams, listWaiters),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -310,6 +310,7 @@ static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>>
   }
 }
 
+
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -366,7 +367,8 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
 
 static byte[] HandleXAdd(
   string[] command,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   string key = command[1];
   string id = command[2];
@@ -391,8 +393,10 @@ static byte[] HandleXAdd(
       }
 
       stream.Add((id, fields));
-      return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
     }
+
+    RedisHelpers.NotifyStreamWaiters(key, listWaiters);
+    return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
   }
 
   if (id.Contains("-*"))
@@ -417,8 +421,10 @@ static byte[] HandleXAdd(
       }
 
       stream.Add((id, fields));
-      return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
     }
+
+    RedisHelpers.NotifyStreamWaiters(key, listWaiters);
+    return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
   }
 
   if (id == "0-0")
@@ -457,9 +463,10 @@ static byte[] HandleXAdd(
     }
 
     streamData.Add((id, fieldsDict));
-
-    return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
   }
+
+  RedisHelpers.NotifyStreamWaiters(key, listWaiters);
+  return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
 }
 
 static byte[] HandleGetType(
@@ -542,12 +549,25 @@ static byte[] HandleXRange(
   return Encoding.UTF8.GetBytes(result.ToString());
 }
 
-static byte[] HandleXRead(
+static async Task<byte[]> HandleXReadAsync(
   string[] command,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
+  int blockTimeout = -1;
+  int commandOffset = 1;
+
+  if (command.Length > 1 && command[1].ToUpper() == "BLOCK")
+  {
+    if (command.Length > 2 && int.TryParse(command[2], out int timeout))
+    {
+      blockTimeout = timeout;
+      commandOffset = 3;
+    }
+  }
+
   int streamsIndex = -1;
-  for (int i = 1; i < command.Length; i++)
+  for (int i = commandOffset; i < command.Length; i++)
   {
     if (command[i].ToUpper() == "STREAMS")
     {
@@ -571,65 +591,90 @@ static byte[] HandleXRead(
     streamIds.Add(command[streamsIndex + 1 + numStreams + i]);
   }
 
-  var result = new StringBuilder();
-  var streamResults = new List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)>();
-
-  for (int i = 0; i < streamKeys.Count; i++)
+  while (true)
   {
-    string key = streamKeys[i];
-    string startId = streamIds[i];
+    var streamResults = new List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)>();
 
-    if (!streams.TryGetValue(key, out var stream))
+    for (int i = 0; i < streamKeys.Count; i++)
     {
-      continue;
+      string key = streamKeys[i];
+      string startId = streamIds[i];
+
+      if (!streams.TryGetValue(key, out var stream))
+      {
+        continue;
+      }
+
+      var matchingEntries = new List<(string Id, Dictionary<string, string> Fields)>();
+
+      lock (stream)
+      {
+        foreach (var entry in stream)
+        {
+          if (RedisHelpers.CompareStreamIds(entry.Id, startId) > 0)
+          {
+            matchingEntries.Add(entry);
+          }
+        }
+      }
+
+      if (matchingEntries.Count > 0)
+      {
+        streamResults.Add((key, matchingEntries));
+      }
     }
 
-    var matchingEntries = new List<(string Id, Dictionary<string, string> Fields)>();
-
-    lock (stream)
+    if (streamResults.Count > 0)
     {
-      foreach (var entry in stream)
+      return RedisHelpers.BuildXReadResponse(streamResults);
+    }
+
+    if (blockTimeout == -1)
+    {
+      return Encoding.UTF8.GetBytes("*-1\r\n");
+    }
+
+    var tasks = new List<Task>();
+    var tcsList = new List<TaskCompletionSource<string?>>();
+
+    foreach (var key in streamKeys)
+    {
+      var tcs = new TaskCompletionSource<string?>();
+      var waiters = listWaiters.GetOrAdd(key, _ => new List<TaskCompletionSource<string?>>());
+
+      lock (waiters)
       {
-        if (RedisHelpers.CompareStreamIds(entry.Id, startId) > 0)
+        waiters.Add(tcs);
+      }
+
+      tcsList.Add(tcs);
+      tasks.Add(tcs.Task);
+    }
+
+    Task timeoutTask = blockTimeout > 0
+      ? Task.Delay(blockTimeout)
+      : Task.Delay(Timeout.Infinite);
+
+    tasks.Add(timeoutTask);
+
+    var completedTask = await Task.WhenAny(tasks);
+
+    for (int i = 0; i < streamKeys.Count; i++)
+    {
+      var key = streamKeys[i];
+      if (listWaiters.TryGetValue(key, out var waiters))
+      {
+        lock (waiters)
         {
-          matchingEntries.Add(entry);
+          waiters.Remove(tcsList[i]);
         }
       }
     }
 
-    if (matchingEntries.Count > 0)
+    if (completedTask == timeoutTask)
     {
-      streamResults.Add((key, matchingEntries));
+      return Encoding.UTF8.GetBytes("*-1\r\n");
     }
   }
-
-  if (streamResults.Count == 0)
-  {
-    return Encoding.UTF8.GetBytes("*-1\r\n");
-  }
-
-  result.Append($"*{streamResults.Count}\r\n");
-
-  foreach (var (key, entries) in streamResults)
-  {
-    result.Append("*2\r\n");
-    result.Append($"${key.Length}\r\n{key}\r\n");
-
-    result.Append($"*{entries.Count}\r\n");
-
-    foreach (var (id, fields) in entries)
-    {
-      result.Append("*2\r\n");
-      result.Append($"${id.Length}\r\n{id}\r\n");
-
-      result.Append($"*{fields.Count * 2}\r\n");
-      foreach (var (fieldName, fieldValue) in fields)
-      {
-        result.Append($"${fieldName.Length}\r\n{fieldName}\r\n");
-        result.Append($"${fieldValue.Length}\r\n{fieldValue}\r\n");
-      }
-    }
-  }
-
-  return Encoding.UTF8.GetBytes(result.ToString());
 }
+
