@@ -1,9 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection;
 using System.Text;
-using System.Text.RegularExpressions;
+using RedisServer;
 
 await MainAsync();
 
@@ -44,7 +43,7 @@ static async Task HandleClientAsync(
       if (bytesRead <= 0) return;
 
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-      var command = ParseRespArray(request);
+      var command = RedisHelpers.ParseRespArray(request);
       
       byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters);
       await stream.WriteAsync(response, 0, response.Length, ct);
@@ -82,7 +81,8 @@ static async Task<byte[]> ProcessCommand(
     "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
     "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists, streams),
     "XADD" when command.Length >= 4 => HandleXAdd(command, streams),
-    "XRANGE" when command.Length >= 4 => HandleXRange(command, streams), 
+    "XRANGE" when command.Length >= 4 => HandleXRange(command, streams),
+    "XREAD" when command.Length >= 4 => HandleXRead(command, streams),
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -174,6 +174,7 @@ static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<st
 
   return Encoding.UTF8.GetBytes($":{count}\r\n");
 }
+
 static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -299,7 +300,6 @@ static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>>
 
     lock (list)
     {
-      // Notify one waiter per available element
       while (waiters.Count > 0 && list.Count > 0)
       {
         var waiter = waiters[0];
@@ -366,21 +366,19 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
 
 static byte[] HandleXAdd(
   string[] command,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams
-)
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
   string key = command[1];
   string id = command[2];
 
-  // handle fully auto generated id
   if (id == "*")
   {
     var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
 
     lock (stream)
     {
-      long currentTime = GetCurrentMilliseconds();
-      long sequenceNumber = GenerateSequenceNumber(stream, currentTime.ToString());
+      long currentTime = RedisHelpers.GetCurrentMilliseconds();
+      long sequenceNumber = RedisHelpers.GenerateSequenceNumber(stream, currentTime.ToString());
       id = $"{currentTime}-{sequenceNumber}";
 
       var fields = new Dictionary<string, string>();
@@ -397,7 +395,6 @@ static byte[] HandleXAdd(
     }
   }
 
-  // handle auto generation of seq number
   if (id.Contains("-*"))
   {
     var parts = id.Split('-');
@@ -407,7 +404,7 @@ static byte[] HandleXAdd(
 
     lock (stream)
     {
-      long sequenceNumber = GenerateSequenceNumber(stream, timePart);
+      long sequenceNumber = RedisHelpers.GenerateSequenceNumber(stream, timePart);
       id = $"{timePart}-{sequenceNumber}";
 
       var fields = new Dictionary<string, string>();
@@ -438,7 +435,7 @@ static byte[] HandleXAdd(
     }
   }
 
-  var streamData = streams.GetOrAdd(key, _ => new List<(String, Dictionary<string, string>)>());
+  var streamData = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
 
   lock (streamData)
   {
@@ -446,14 +443,14 @@ static byte[] HandleXAdd(
     {
       string lastId = streamData[streamData.Count - 1].Id;
 
-      if (CompareStreamIds(id, lastId) <= 0)
+      if (RedisHelpers.CompareStreamIds(id, lastId) <= 0)
       {
         return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
       }
     }
     else
     {
-      if (CompareStreamIds(id, "0-0") <= 0)
+      if (RedisHelpers.CompareStreamIds(id, "0-0") <= 0)
       {
         return Encoding.UTF8.GetBytes("-ERR The ID specified in XADD must be greater than 0-0\r\n");
       }
@@ -463,59 +460,6 @@ static byte[] HandleXAdd(
 
     return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
   }
-}
-
-static long GetCurrentMilliseconds()
-{
-  return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-}
-
-static long GenerateSequenceNumber(List<(string Id, Dictionary<string, string> Fields)> stream, string timePart)
-{
-  if (timePart == "0")
-    return 1;
-
-  for (int i = stream.Count - 1; i >= 0; i--) // find last entry with same time part
-  {
-    var (ms, seq) = ParseStreamId(stream[i].Id);
-
-    if (ms.ToString() == timePart)
-    {
-      return seq + 1; // entry with the same time
-    }
-
-    if (ms < long.Parse(timePart))
-    {
-      break; // surpassed entryies with current time part
-    }
-  }
-
-  return 0; // no entries with time part exist, so start at 0
-
-}
-
-static (long milliseconds, long sequence) ParseStreamId(string id)
-{
-  var parts = id.Split('-');
-  if (parts.Length != 2)
-    return (0, 0);
-
-  long.TryParse(parts[0], out long milliseconds);
-  long.TryParse(parts[1], out long sequence);
-
-  return (milliseconds, sequence);
-}
-
-static int CompareStreamIds(string id1, string id2)
-{
-  var (ms1, seq1) = ParseStreamId(id1);
-  var (ms2, seq2) = ParseStreamId(id2);
-
-  if (ms1 != ms2)
-    return ms1.CompareTo(ms2);
-
-  return seq1.CompareTo(seq2);
-
 }
 
 static byte[] HandleGetType(
@@ -533,7 +477,7 @@ static byte[] HandleGetType(
       storage.TryRemove(key, out _);
       return Encoding.UTF8.GetBytes("+none\r\n");
     }
-    return Encoding.UTF8.GetBytes($"+string\r\n");
+    return Encoding.UTF8.GetBytes("+string\r\n");
   }
 
   if (lists.TryGetValue(key, out _))
@@ -546,7 +490,6 @@ static byte[] HandleGetType(
     return Encoding.UTF8.GetBytes("+stream\r\n");
   }
 
-  // key does not exist
   return Encoding.UTF8.GetBytes("+none\r\n");
 }
 
@@ -558,8 +501,8 @@ static byte[] HandleXRange(
   string startId = command[2];
   string endId = command[3];
 
-  startId = NormalizeStreamId(startId, isStart: true);
-  endId = NormalizeStreamId(endId, isStart: false);
+  startId = RedisHelpers.NormalizeStreamId(startId, isStart: true);
+  endId = RedisHelpers.NormalizeStreamId(endId, isStart: false);
 
   if (!streams.TryGetValue(key, out var stream))
   {
@@ -567,13 +510,14 @@ static byte[] HandleXRange(
   }
 
   var result = new StringBuilder();
-  var matchingEntries = new List<(string ID, Dictionary<string, string> Fields)>();
+  var matchingEntries = new List<(string Id, Dictionary<string, string> Fields)>();
 
   lock (stream)
   {
     foreach (var entry in stream)
     {
-      if (CompareStreamIds(entry.Id, startId) >= 0 && CompareStreamIds(entry.Id, endId) <= 0)
+      if (RedisHelpers.CompareStreamIds(entry.Id, startId) >= 0 && 
+          RedisHelpers.CompareStreamIds(entry.Id, endId) <= 0)
       {
         matchingEntries.Add(entry);
       }
@@ -585,7 +529,6 @@ static byte[] HandleXRange(
   foreach (var (id, fields) in matchingEntries)
   {
     result.Append("*2\r\n");
-
     result.Append($"${id.Length}\r\n{id}\r\n");
 
     result.Append($"*{fields.Count * 2}\r\n");
@@ -599,36 +542,94 @@ static byte[] HandleXRange(
   return Encoding.UTF8.GetBytes(result.ToString());
 }
 
-static string NormalizeStreamId(string id, bool isStart)
+static byte[] HandleXRead(
+  string[] command,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
-  if (id.Contains("-"))
+  int streamsIndex = -1;
+  for (int i = 1; i < command.Length; i++)
   {
-    return id;
-  };
-
-  if (isStart)
-  {
-    return $"{id}-0";
-  }
-  else
-  {
-    return $"{id}-{long.MaxValue}";
-  }
-}
-
-static string[] ParseRespArray(string input)
-{
-  var lines = input.Split(new[] { "\r\n" }, StringSplitOptions.None);
-  var result = new List<string>();
-
-  for (int i = 0; i < lines.Length; i++)
-  {
-    if (lines[i].StartsWith("$") && i + 1 < lines.Length)
+    if (command[i].ToUpper() == "STREAMS")
     {
-      result.Add(lines[i + 1]);
-      i++;
+      streamsIndex = i;
+      break;
     }
   }
 
-  return result.ToArray();
+  if (streamsIndex == -1 || streamsIndex + 2 >= command.Length)
+  {
+    return Encoding.UTF8.GetBytes("-ERR wrong number of arguments\r\n");
+  }
+
+  int numStreams = (command.Length - streamsIndex - 1) / 2;
+  var streamKeys = new List<string>();
+  var streamIds = new List<string>();
+
+  for (int i = 0; i < numStreams; i++)
+  {
+    streamKeys.Add(command[streamsIndex + 1 + i]);
+    streamIds.Add(command[streamsIndex + 1 + numStreams + i]);
+  }
+
+  var result = new StringBuilder();
+  var streamResults = new List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)>();
+
+  for (int i = 0; i < streamKeys.Count; i++)
+  {
+    string key = streamKeys[i];
+    string startId = streamIds[i];
+
+    if (!streams.TryGetValue(key, out var stream))
+    {
+      continue;
+    }
+
+    var matchingEntries = new List<(string Id, Dictionary<string, string> Fields)>();
+
+    lock (stream)
+    {
+      foreach (var entry in stream)
+      {
+        if (RedisHelpers.CompareStreamIds(entry.Id, startId) > 0)
+        {
+          matchingEntries.Add(entry);
+        }
+      }
+    }
+
+    if (matchingEntries.Count > 0)
+    {
+      streamResults.Add((key, matchingEntries));
+    }
+  }
+
+  if (streamResults.Count == 0)
+  {
+    return Encoding.UTF8.GetBytes("*-1\r\n");
+  }
+
+  result.Append($"*{streamResults.Count}\r\n");
+
+  foreach (var (key, entries) in streamResults)
+  {
+    result.Append("*2\r\n");
+    result.Append($"${key.Length}\r\n{key}\r\n");
+
+    result.Append($"*{entries.Count}\r\n");
+
+    foreach (var (id, fields) in entries)
+    {
+      result.Append("*2\r\n");
+      result.Append($"${id.Length}\r\n{id}\r\n");
+
+      result.Append($"*{fields.Count * 2}\r\n");
+      foreach (var (fieldName, fieldValue) in fields)
+      {
+        result.Append($"${fieldName.Length}\r\n{fieldName}\r\n");
+        result.Append($"${fieldValue.Length}\r\n{fieldValue}\r\n");
+      }
+    }
+  }
+
+  return Encoding.UTF8.GetBytes(result.ToString());
 }
