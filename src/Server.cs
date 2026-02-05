@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 
 await MainAsync();
 
@@ -80,6 +82,7 @@ static async Task<byte[]> ProcessCommand(
     "BLPOP" when command.Length >= 3 => await HandleBLPopAsync(command, lists, listWaiters),
     "TYPE" when command.Length == 2 => HandleGetType(command, storage, lists, streams),
     "XADD" when command.Length >= 4 => HandleXAdd(command, streams),
+    "XRANGE" when command.Length >= 4 => HandleXRange(command, streams), 
     _ => Encoding.UTF8.GetBytes("+PONG\r\n")
   };
 }
@@ -545,6 +548,72 @@ static byte[] HandleGetType(
 
   // key does not exist
   return Encoding.UTF8.GetBytes("+none\r\n");
+}
+
+static byte[] HandleXRange(
+  string[] command,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+{
+  string key = command[1];
+  string startId = command[2];
+  string endId = command[3];
+
+  startId = NormalizeStreamId(startId, isStart: true);
+  endId = NormalizeStreamId(endId, isStart: false);
+
+  if (!streams.TryGetValue(key, out var stream))
+  {
+    return Encoding.UTF8.GetBytes("*0\r\n");
+  }
+
+  var result = new StringBuilder();
+  var matchingEntries = new List<(string ID, Dictionary<string, string> Fields)>();
+
+  lock (stream)
+  {
+    foreach (var entry in stream)
+    {
+      if (CompareStreamIds(entry.Id, startId) >= 0 && CompareStreamIds(entry.Id, endId) <= 0)
+      {
+        matchingEntries.Add(entry);
+      }
+    }
+  }
+
+  result.Append($"*{matchingEntries.Count}\r\n");
+
+  foreach (var (id, fields) in matchingEntries)
+  {
+    result.Append("*2\r\n");
+
+    result.Append($"${id.Length}\r\n{id}\r\n");
+
+    result.Append($"*{fields.Count * 2}\r\n");
+    foreach (var (fieldName, fieldValue) in fields)
+    {
+      result.Append($"${fieldName.Length}\r\n{fieldName}\r\n");
+      result.Append($"${fieldValue.Length}\r\n{fieldValue}\r\n");
+    }
+  }
+
+  return Encoding.UTF8.GetBytes(result.ToString());
+}
+
+static string NormalizeStreamId(string id, bool isStart)
+{
+  if (id.Contains("-"))
+  {
+    return id;
+  };
+
+  if (isStart)
+  {
+    return $"{id}-0";
+  }
+  else
+  {
+    return $"{id}-{long.MaxValue}";
+  }
 }
 
 static string[] ParseRespArray(string input)
