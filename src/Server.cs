@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Dynamic;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using System.Text;
 using RedisServer;
@@ -71,17 +72,8 @@ static async Task<byte[]> ProcessCommand(
 
   string cmd = command[0].ToUpper();
 
-  if (cmd == "MULTI")
-  {
-    return HandleMulti(transactionState);
-  }
-
-  if (cmd == "EXEC")
-  {
-    return await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState);
-  }
-
-  if (transactionState.InTransaction)
+  // If in transaction, queue commands
+  if (transactionState.InTransaction && cmd != "MULTI" && cmd != "EXEC" && cmd != "DISCARD")
   {
     transactionState.QueuedCommands.Add(command);
     return Encoding.UTF8.GetBytes("+QUEUED\r\n");
@@ -96,6 +88,9 @@ static async Task<byte[]> ProcessCommand(
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
+    "MULTI" => HandleMulti(transactionState),
+    "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState),
+    "DISCARD" => HandleDiscard(transactionState), 
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -232,6 +227,19 @@ static async Task<byte[]> HandleExecAsync(
   }
 
   return Encoding.UTF8.GetBytes(result.ToString());
+}
+
+static byte[] HandleDiscard(TransactionState transactionState)
+{
+  if (!transactionState.InTransaction)
+  {
+    return Encoding.UTF8.GetBytes("-ERR DISCARD without MULTI\r\n");
+  }
+
+  transactionState.InTransaction = false;
+  transactionState.QueuedCommands.Clear();
+
+  return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
