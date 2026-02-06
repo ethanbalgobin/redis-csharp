@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Dynamic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -69,6 +70,22 @@ static async Task<byte[]> ProcessCommand(
 
   string cmd = command[0].ToUpper();
 
+  if (cmd == "MULTI")
+  {
+    return HandleMulti(transactionState);
+  }
+
+  if (cmd == "EXEC")
+  {
+    return await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState);
+  }
+
+  if (transactionState.InTransaction)
+  {
+    transactionState.QueuedCommands.Add(command);
+    return Encoding.UTF8.GetBytes("+QUEUED\r\n");
+  }
+
   return cmd switch
   {
     "PING" => HandlePing(),
@@ -78,8 +95,6 @@ static async Task<byte[]> ProcessCommand(
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
-    "MULTI" => HandleMulti(transactionState),
-    "EXEC" => HandleExec(transactionState),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -172,14 +187,23 @@ static byte[] HandleMulti(TransactionState transactionState)
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
-static byte[] HandleExec(TransactionState transactionState)
+static async Task<byte[]> HandleExecAsync(
+  string[] originalCommand,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
+  TransactionState transactionState)
 {
   if (!transactionState.InTransaction)
   {
     return Encoding.UTF8.GetBytes("-ERR EXEC without MULTI\r\n");
   }
 
+  // Clear transaction state
   transactionState.InTransaction = false;
+  transactionState.QueuedCommands.Clear();
+  
   return Encoding.UTF8.GetBytes("*0\r\n");
 }
 
