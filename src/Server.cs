@@ -7,16 +7,29 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using RedisServer;
 
-await MainAsync();
+await MainAsync(args);
 
-static async Task MainAsync()
+static async Task MainAsync(string[] args)
 {
   var storage = new ConcurrentDictionary<string, (string Value, DateTime? Expiry)>();
   var lists = new ConcurrentDictionary<string, List<string>>();
   var streams = new ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>>();
   var listWaiters = new ConcurrentDictionary<string, List<TaskCompletionSource<string?>>>();
 
-  TcpListener server = new TcpListener(IPAddress.Any, 6379);
+// try to parse port from startup command arguments
+  int port = 6379; // default port if no arg is provided
+  for (int i = 0; i < args.Length; i++)
+  {
+    if (args[i] == "--port" && i + 1 < args.Length)
+    {
+      if (int.TryParse(args[i + 1], out int parsedPort))
+      {
+        port = parsedPort;
+      }
+    }
+  }
+
+  TcpListener server = new TcpListener(IPAddress.Any, port);
   server.Start();
   
   while (true)
