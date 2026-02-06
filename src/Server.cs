@@ -1,8 +1,6 @@
 using System.Collections.Concurrent;
-using System.ComponentModel.DataAnnotations;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection;
 using System.Text;
 using RedisServer;
 
@@ -36,6 +34,7 @@ static async Task HandleClientAsync(
   using var _ = client;
   var stream = client.GetStream();
   var buffer = new byte[1024];
+  var transactionState = new TransactionState();
 
   try
   {
@@ -47,7 +46,7 @@ static async Task HandleClientAsync(
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       var command = RedisHelpers.ParseRespArray(request);
       
-      byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters);
+      byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters, transactionState);
       await stream.WriteAsync(response, 0, response.Length, ct);
     }
   }
@@ -62,7 +61,8 @@ static async Task<byte[]> ProcessCommand(
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
-  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
+  ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
+  TransactionState transactionState)
 {
   if (command.Length == 0)
     return Encoding.UTF8.GetBytes("+PONG\r\n");
@@ -78,7 +78,8 @@ static async Task<byte[]> ProcessCommand(
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
-    "MULTI" => HandleMulti(),
+    "MULTI" => HandleMulti(transactionState),
+    "EXEC" => HandleExec(transactionState),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -163,6 +164,23 @@ static byte[] HandleIncr(string key, ConcurrentDictionary<string, (string Value,
   storage[key] = (value.ToString(), entry.Expiry);
   
   return Encoding.UTF8.GetBytes($":{value}\r\n");
+}
+
+static byte[] HandleMulti(TransactionState transactionState)
+{
+  transactionState.InTransaction = true;
+  return Encoding.UTF8.GetBytes("+OK\r\n");
+}
+
+static byte[] HandleExec(TransactionState transactionState)
+{
+  if (!transactionState.InTransaction)
+  {
+    return Encoding.UTF8.GetBytes("-ERR EXEC without MULTI\r\n");
+  }
+
+  transactionState.InTransaction = false;
+  return Encoding.UTF8.GetBytes("*0\r\n");
 }
 
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
@@ -339,7 +357,6 @@ static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>>
     }
   }
 }
-
 
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
@@ -618,8 +635,7 @@ static async Task<byte[]> HandleXReadAsync(
   for (int i = 0; i < numStreams; i++)
   {
     streamKeys.Add(command[streamsIndex + 1 + i]);
-
-    // Replace $ with the last ID in the stream
+    
     string id = command[streamsIndex + 1 + numStreams + i];
     if (id == "$")
     {
@@ -628,7 +644,6 @@ static async Task<byte[]> HandleXReadAsync(
     streamIds.Add(id);
   }
 
-  // Try to get results immediately
   while (true)
   {
     var streamResults = new List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)>();
@@ -662,19 +677,16 @@ static async Task<byte[]> HandleXReadAsync(
       }
     }
 
-    // If we have results, return them
     if (streamResults.Count > 0)
     {
       return RedisHelpers.BuildXReadResponse(streamResults);
     }
 
-    // If not blocking, return null array
     if (blockTimeout == -1)
     {
       return Encoding.UTF8.GetBytes("*-1\r\n");
     }
 
-    // Block and wait for new entries
     var tasks = new List<Task>();
     var tcsList = new List<TaskCompletionSource<string?>>();
 
@@ -692,15 +704,14 @@ static async Task<byte[]> HandleXReadAsync(
       tasks.Add(tcs.Task);
     }
 
-    Task timeoutTask = blockTimeout > 0
-      ? Task.Delay(blockTimeout)
+    Task timeoutTask = blockTimeout > 0 
+      ? Task.Delay(blockTimeout) 
       : Task.Delay(Timeout.Infinite);
 
     tasks.Add(timeoutTask);
 
     var completedTask = await Task.WhenAny(tasks);
 
-    // Clean up all waiters
     for (int i = 0; i < streamKeys.Count; i++)
     {
       var key = streamKeys[i];
@@ -713,17 +724,9 @@ static async Task<byte[]> HandleXReadAsync(
       }
     }
 
-    // If timeout, return null
     if (completedTask == timeoutTask)
     {
       return Encoding.UTF8.GetBytes("*-1\r\n");
     }
-
-    // loop again to collect results
   }
-}
-
-static byte[] HandleMulti()
-{
-  return Encoding.UTF8.GetBytes("+OK\r\n");
 }
