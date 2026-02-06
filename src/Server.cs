@@ -16,26 +16,40 @@ static async Task MainAsync(string[] args)
   var streams = new ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>>();
   var listWaiters = new ConcurrentDictionary<string, List<TaskCompletionSource<string?>>>();
 
-// try to parse port from startup command arguments
-  int port = 6379; // default port if no arg is provided
+  var config = new ServerConfig();
+
+  // try to parse port from startup command arguments
   for (int i = 0; i < args.Length; i++)
   {
     if (args[i] == "--port" && i + 1 < args.Length)
     {
       if (int.TryParse(args[i + 1], out int parsedPort))
       {
-        port = parsedPort;
+        config.Port = parsedPort;
+      }
+    }
+    else if (args[i] == "--replicaof" && i + 1 <= args.Length)
+    {
+      var parts = args[i + 1].Split(' ');
+      if (parts.Length == 2)
+      {
+        config.IsReplica = true;
+        config.MasterHost = parts[0];
+        if (int.TryParse(parts[1], out int masterPort))
+        {
+          config.MasterPort = masterPort;
+        }
       }
     }
   }
 
-  TcpListener server = new TcpListener(IPAddress.Any, port);
+  TcpListener server = new TcpListener(IPAddress.Any, config.Port);
   server.Start();
   
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
-    _ = HandleClientAsync(client, storage, lists, streams, listWaiters, CancellationToken.None);
+    _ = HandleClientAsync(client, storage, lists, streams, listWaiters, config, CancellationToken.None);
   }
 }
 
@@ -45,6 +59,7 @@ static async Task HandleClientAsync(
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
+  ServerConfig config,
   CancellationToken ct)
 {
   using var _ = client;
@@ -62,7 +77,7 @@ static async Task HandleClientAsync(
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       var command = RedisHelpers.ParseRespArray(request);
       
-      byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters, transactionState);
+      byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters, transactionState, config);
       await stream.WriteAsync(response, 0, response.Length, ct);
     }
   }
@@ -73,12 +88,13 @@ static async Task HandleClientAsync(
 }
 
 static async Task<byte[]> ProcessCommand(
-  string[] command, 
-  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
+  string[] command,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
-  TransactionState transactionState)
+  TransactionState transactionState,
+  ServerConfig config)
 {
   if (command.Length == 0)
     return Encoding.UTF8.GetBytes("+PONG\r\n");
@@ -102,9 +118,9 @@ static async Task<byte[]> ProcessCommand(
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
     "MULTI" => HandleMulti(transactionState),
-    "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState),
+    "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState, config),
     "DISCARD" => HandleDiscard(transactionState),
-    "INFO" => HandleInfo(command),
+    "INFO" => HandleInfo(command, config),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -203,7 +219,8 @@ static async Task<byte[]> HandleExecAsync(
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
-  TransactionState transactionState)
+  TransactionState transactionState,
+  ServerConfig config)
 {
   if (!transactionState.InTransaction)
   {
@@ -227,7 +244,7 @@ static async Task<byte[]> HandleExecAsync(
 
   foreach (var cmd in queuedCommands)
   {
-    byte[] response = await ProcessCommand(cmd, storage, lists, streams, listWaiters, tempTransactionState);
+    byte[] response = await ProcessCommand(cmd, storage, lists, streams, listWaiters, tempTransactionState, config);
     responses.Add(response);
   }
 
@@ -256,14 +273,15 @@ static byte[] HandleDiscard(TransactionState transactionState)
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
-static byte[] HandleInfo(string[] command)
+static byte[] HandleInfo(string[] command, ServerConfig config)
 {
   // check if replication section is requested
   string section = command.Length > 1 ? command[1].ToLower() : "";
 
   if (section == "replication" || section == "")
   {
-    string response = "role:master";
+    string role = config.IsReplica ? "slave" : "master";
+    string response = $"role:{role}";
     return Encoding.UTF8.GetBytes($"${response.Length}\r\n{response}\r\n");
   }
 
