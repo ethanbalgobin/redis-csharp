@@ -103,7 +103,8 @@ static async Task<byte[]> ProcessCommand(
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
     "MULTI" => HandleMulti(transactionState),
     "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState),
-    "DISCARD" => HandleDiscard(transactionState), 
+    "DISCARD" => HandleDiscard(transactionState),
+    "INFO" => HandleInfo(command),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -253,6 +254,21 @@ static byte[] HandleDiscard(TransactionState transactionState)
   transactionState.QueuedCommands.Clear();
 
   return Encoding.UTF8.GetBytes("+OK\r\n");
+}
+
+static byte[] HandleInfo(string[] command)
+{
+  // check if replication section is requested
+  string section = command.Length > 1 ? command[1].ToLower() : "";
+
+  if (section == "replication" || section == "")
+  {
+    string response = "role:master";
+    return Encoding.UTF8.GetBytes($"${response.Length}\r\n{response}\r\n");
+  }
+
+  // return bulk empty string for other sections
+  return Encoding.UTF8.GetBytes("$-1\r\n");
 }
 
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
