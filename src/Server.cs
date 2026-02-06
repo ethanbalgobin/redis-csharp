@@ -1,14 +1,16 @@
 using System.Collections.Concurrent;
-using System.Dynamic;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection.Metadata;
 using System.Runtime.CompilerServices;
 using System.Text;
 using RedisServer;
 
 await MainAsync(args);
 
+/// <summary>
+/// Main entry point for the Redis server. Parses command-line arguments and starts the TCP listener.
+/// </summary>
+/// <param name="args">Command-line arguments (--port, --replicaof)</param>
 static async Task MainAsync(string[] args)
 {
   var storage = new ConcurrentDictionary<string, (string Value, DateTime? Expiry)>();
@@ -16,9 +18,9 @@ static async Task MainAsync(string[] args)
   var streams = new ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>>();
   var listWaiters = new ConcurrentDictionary<string, List<TaskCompletionSource<string?>>>();
 
+  // Parse command-line arguments
   var config = new ServerConfig();
-
-  // try to parse port from startup command arguments
+  
   for (int i = 0; i < args.Length; i++)
   {
     if (args[i] == "--port" && i + 1 < args.Length)
@@ -28,7 +30,7 @@ static async Task MainAsync(string[] args)
         config.Port = parsedPort;
       }
     }
-    else if (args[i] == "--replicaof" && i + 1 <= args.Length)
+    else if (args[i] == "--replicaof" && i + 1 < args.Length)
     {
       var parts = args[i + 1].Split(' ');
       if (parts.Length == 2)
@@ -53,6 +55,16 @@ static async Task MainAsync(string[] args)
   }
 }
 
+/// <summary>
+/// Handles a single client connection, reading commands and sending responses.
+/// </summary>
+/// <param name="client">The TCP client connection</param>
+/// <param name="storage">Key-value storage for strings with optional expiry</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+/// <param name="listWaiters">Task completion sources for blocking list operations</param>
+/// <param name="config">Server configuration including port and replication settings</param>
+/// <param name="ct">Cancellation token</param>
 static async Task HandleClientAsync(
   TcpClient client,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
@@ -87,9 +99,21 @@ static async Task HandleClientAsync(
   }
 }
 
+/// <summary>
+/// Processes a Redis command and returns the appropriate RESP-encoded response.
+/// Handles transaction queuing and execution.
+/// </summary>
+/// <param name="command">Parsed command array</param>
+/// <param name="storage">Key-value storage for strings</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+/// <param name="listWaiters">Task completion sources for blocking operations</param>
+/// <param name="transactionState">Current transaction state for this connection</param>
+/// <param name="config">Server configuration</param>
+/// <returns>RESP-encoded response bytes</returns>
 static async Task<byte[]> ProcessCommand(
-  string[] command,
-  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  string[] command, 
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
@@ -101,13 +125,14 @@ static async Task<byte[]> ProcessCommand(
 
   string cmd = command[0].ToUpper();
 
-  // If in transaction, queue commands
+  // If in transaction, queue commands (except MULTI, EXEC, DISCARD)
   if (transactionState.InTransaction && cmd != "MULTI" && cmd != "EXEC" && cmd != "DISCARD")
   {
     transactionState.QueuedCommands.Add(command);
     return Encoding.UTF8.GetBytes("+QUEUED\r\n");
   }
 
+  // Execute commands
   return cmd switch
   {
     "PING" => HandlePing(),
@@ -133,16 +158,31 @@ static async Task<byte[]> ProcessCommand(
   };
 }
 
+/// <summary>
+/// Handles the PING command.
+/// </summary>
+/// <returns>PONG response as a simple string</returns>
 static byte[] HandlePing()
 {
   return Encoding.UTF8.GetBytes("+PONG\r\n");
 }
 
+/// <summary>
+/// Handles the ECHO command, returning the provided message.
+/// </summary>
+/// <param name="message">Message to echo back</param>
+/// <returns>Message encoded as a bulk string</returns>
 static byte[] HandleEcho(string message)
 {
   return Encoding.UTF8.GetBytes($"${message.Length}\r\n{message}\r\n");
 }
 
+/// <summary>
+/// Handles the SET command, storing a key-value pair with optional expiry.
+/// </summary>
+/// <param name="command">Command array (SET key value [EX seconds | PX milliseconds])</param>
+/// <param name="storage">Key-value storage</param>
+/// <returns>OK response as a simple string</returns>
 static byte[] HandleSet(string[] command, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage)
 {
   string key = command[1];
@@ -167,6 +207,12 @@ static byte[] HandleSet(string[] command, ConcurrentDictionary<string, (string V
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
+/// <summary>
+/// Handles the GET command, retrieving a value by key.
+/// </summary>
+/// <param name="key">Key to retrieve</param>
+/// <param name="storage">Key-value storage</param>
+/// <returns>Value as bulk string, or null bulk string if key doesn't exist or is expired</returns>
 static byte[] HandleGet(string key, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage)
 {
   if (!storage.TryGetValue(key, out var entry))
@@ -181,6 +227,12 @@ static byte[] HandleGet(string key, ConcurrentDictionary<string, (string Value, 
   return Encoding.UTF8.GetBytes($"${entry.Value.Length}\r\n{entry.Value}\r\n");
 }
 
+/// <summary>
+/// Handles the INCR command, incrementing an integer value by 1.
+/// </summary>
+/// <param name="key">Key to increment</param>
+/// <param name="storage">Key-value storage</param>
+/// <returns>New value as an integer, or error if value is not an integer</returns>
 static byte[] HandleIncr(string key, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage)
 {
   if (!storage.TryGetValue(key, out var entry))
@@ -207,12 +259,28 @@ static byte[] HandleIncr(string key, ConcurrentDictionary<string, (string Value,
   return Encoding.UTF8.GetBytes($":{value}\r\n");
 }
 
+/// <summary>
+/// Handles the MULTI command, starting a transaction.
+/// </summary>
+/// <param name="transactionState">Transaction state to update</param>
+/// <returns>OK response as a simple string</returns>
 static byte[] HandleMulti(TransactionState transactionState)
 {
   transactionState.InTransaction = true;
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
+/// <summary>
+/// Handles the EXEC command, executing all queued commands in a transaction.
+/// </summary>
+/// <param name="originalCommand">The original EXEC command</param>
+/// <param name="storage">Key-value storage</param>
+/// <param name="lists">List storage</param>
+/// <param name="streams">Stream storage</param>
+/// <param name="listWaiters">Blocking operation waiters</param>
+/// <param name="transactionState">Transaction state</param>
+/// <param name="config">Server configuration</param>
+/// <returns>Array of responses from queued commands, or error if not in transaction</returns>
 static async Task<byte[]> HandleExecAsync(
   string[] originalCommand,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
@@ -228,8 +296,7 @@ static async Task<byte[]> HandleExecAsync(
   }
 
   var queuedCommands = new List<string[]>(transactionState.QueuedCommands);
-
-  // Clear transaction state
+  
   transactionState.InTransaction = false;
   transactionState.QueuedCommands.Clear();
 
@@ -239,9 +306,8 @@ static async Task<byte[]> HandleExecAsync(
   }
 
   var responses = new List<byte[]>();
-
   var tempTransactionState = new TransactionState();
-
+  
   foreach (var cmd in queuedCommands)
   {
     byte[] response = await ProcessCommand(cmd, storage, lists, streams, listWaiters, tempTransactionState, config);
@@ -250,8 +316,7 @@ static async Task<byte[]> HandleExecAsync(
 
   var result = new StringBuilder();
   result.Append($"*{responses.Count}\r\n");
-
-
+  
   foreach (var response in responses)
   {
     result.Append(Encoding.UTF8.GetString(response));
@@ -260,6 +325,11 @@ static async Task<byte[]> HandleExecAsync(
   return Encoding.UTF8.GetBytes(result.ToString());
 }
 
+/// <summary>
+/// Handles the DISCARD command, aborting a transaction and discarding queued commands.
+/// </summary>
+/// <param name="transactionState">Transaction state to clear</param>
+/// <returns>OK response, or error if not in transaction</returns>
 static byte[] HandleDiscard(TransactionState transactionState)
 {
   if (!transactionState.InTransaction)
@@ -273,22 +343,46 @@ static byte[] HandleDiscard(TransactionState transactionState)
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
+/// <summary>
+/// Handles the INFO command, returning server information.
+/// For replication section, includes role, master_replid, and master_repl_offset.
+/// </summary>
+/// <param name="command">Command array (INFO [section])</param>
+/// <param name="config">Server configuration</param>
+/// <returns>Information as a bulk string</returns>
 static byte[] HandleInfo(string[] command, ServerConfig config)
 {
-  // check if replication section is requested
   string section = command.Length > 1 ? command[1].ToLower() : "";
 
   if (section == "replication" || section == "")
   {
-    string role = config.IsReplica ? "slave" : "master";
-    string response = $"role:{role}";
+    var lines = new List<string>();
+
+    if (config.IsReplica)
+    {
+      lines.Add("role:slave");
+    }
+    else
+    {
+      lines.Add("role:master");
+      lines.Add("master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb");
+      lines.Add("master_repl_offset:0");
+    }
+
+    string response = string.Join("\r\n", lines);
     return Encoding.UTF8.GetBytes($"${response.Length}\r\n{response}\r\n");
   }
 
-  // return bulk empty string for other sections
   return Encoding.UTF8.GetBytes("$-1\r\n");
 }
 
+/// <summary>
+/// Handles the RPUSH command, appending values to the end of a list.
+/// </summary>
+/// <param name="command">Command array (RPUSH key value [value ...])</param>
+/// <param name="lists">List storage</param>
+/// <param name="listWaiters">Blocking operation waiters to notify</param>
+/// <returns>Length of list after push as an integer</returns>
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   string key = command[1];
@@ -309,6 +403,13 @@ static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<st
   return Encoding.UTF8.GetBytes($":{count}\r\n");
 }
 
+/// <summary>
+/// Handles the LPUSH command, prepending values to the start of a list.
+/// </summary>
+/// <param name="command">Command array (LPUSH key value [value ...])</param>
+/// <param name="lists">List storage</param>
+/// <param name="listWaiters">Blocking operation waiters to notify</param>
+/// <returns>Length of list after push as an integer</returns>
 static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   string key = command[1];
@@ -329,6 +430,12 @@ static byte[] HandleLPush(string[] command, ConcurrentDictionary<string, List<st
   return Encoding.UTF8.GetBytes($":{count}\r\n");
 }
 
+/// <summary>
+/// Handles the LPOP command, removing and returning elements from the start of a list.
+/// </summary>
+/// <param name="command">Command array (LPOP key [count])</param>
+/// <param name="lists">List storage</param>
+/// <returns>Popped value(s) as bulk string or array, or null if list is empty</returns>
 static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -379,6 +486,13 @@ static byte[] HandleLPop(string[] command, ConcurrentDictionary<string, List<str
   }
 }
 
+/// <summary>
+/// Handles the BLPOP command, blocking until a value is available or timeout occurs.
+/// </summary>
+/// <param name="command">Command array (BLPOP key [key ...] timeout)</param>
+/// <param name="lists">List storage</param>
+/// <param name="listWaiters">Blocking operation waiters</param>
+/// <returns>Array with key and value, or null if timeout</returns>
 static async Task<byte[]> HandleBLPopAsync(
   string[] command, 
   ConcurrentDictionary<string, List<string>> lists, 
@@ -442,6 +556,12 @@ static async Task<byte[]> HandleBLPopAsync(
   }
 }
 
+/// <summary>
+/// Notifies waiting BLPOP operations that a list has new elements.
+/// </summary>
+/// <param name="key">List key that was modified</param>
+/// <param name="lists">List storage</param>
+/// <param name="listWaiters">Blocking operation waiters to notify</param>
 static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
 {
   if (!listWaiters.TryGetValue(key, out var waiters))
@@ -464,6 +584,12 @@ static void NotifyWaiters(string key, ConcurrentDictionary<string, List<string>>
   }
 }
 
+/// <summary>
+/// Handles the LLEN command, returning the length of a list.
+/// </summary>
+/// <param name="command">Command array (LLEN key)</param>
+/// <param name="lists">List storage</param>
+/// <returns>List length as an integer</returns>
 static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -474,6 +600,12 @@ static byte[] HandleLLen(string[] command, ConcurrentDictionary<string, List<str
   return Encoding.UTF8.GetBytes($":{list.Count}\r\n");
 }
 
+/// <summary>
+/// Handles the LRANGE command, returning a range of elements from a list.
+/// </summary>
+/// <param name="command">Command array (LRANGE key start stop)</param>
+/// <param name="lists">List storage</param>
+/// <returns>Array of elements in the specified range</returns>
 static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<string>> lists)
 {
   string key = command[1];
@@ -518,6 +650,13 @@ static byte[] HandleLRange(string[] command, ConcurrentDictionary<string, List<s
   }
 }
 
+/// <summary>
+/// Handles the XADD command, adding an entry to a stream.
+/// </summary>
+/// <param name="command">Command array (XADD key ID field value [field value ...])</param>
+/// <param name="streams">Stream storage</param>
+/// <param name="listWaiters">Blocking operation waiters to notify</param>
+/// <returns>Generated or validated stream ID as bulk string, or error</returns>
 static byte[] HandleXAdd(
   string[] command,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
@@ -622,6 +761,14 @@ static byte[] HandleXAdd(
   return Encoding.UTF8.GetBytes($"${id.Length}\r\n{id}\r\n");
 }
 
+/// <summary>
+/// Handles the TYPE command, returning the type of value stored at a key.
+/// </summary>
+/// <param name="command">Command array (TYPE key)</param>
+/// <param name="storage">String storage</param>
+/// <param name="lists">List storage</param>
+/// <param name="streams">Stream storage</param>
+/// <returns>Type name as a simple string (string, list, stream, or none)</returns>
 static byte[] HandleGetType(
   string[] command,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
@@ -653,6 +800,12 @@ static byte[] HandleGetType(
   return Encoding.UTF8.GetBytes("+none\r\n");
 }
 
+/// <summary>
+/// Handles the XRANGE command, returning a range of entries from a stream.
+/// </summary>
+/// <param name="command">Command array (XRANGE key start end)</param>
+/// <param name="streams">Stream storage</param>
+/// <returns>Array of stream entries in the specified range</returns>
 static byte[] HandleXRange(
   string[] command,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
@@ -702,6 +855,14 @@ static byte[] HandleXRange(
   return Encoding.UTF8.GetBytes(result.ToString());
 }
 
+/// <summary>
+/// Handles the XREAD command, reading entries from one or more streams.
+/// Supports blocking with BLOCK option and $ special ID.
+/// </summary>
+/// <param name="command">Command array (XREAD [BLOCK milliseconds] STREAMS key [key ...] ID [ID ...])</param>
+/// <param name="streams">Stream storage</param>
+/// <param name="listWaiters">Blocking operation waiters</param>
+/// <returns>Array of stream entries, or null if blocking timeout occurs</returns>
 static async Task<byte[]> HandleXReadAsync(
   string[] command,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
