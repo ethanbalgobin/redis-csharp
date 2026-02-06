@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Dynamic;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using RedisServer;
 
@@ -200,11 +201,37 @@ static async Task<byte[]> HandleExecAsync(
     return Encoding.UTF8.GetBytes("-ERR EXEC without MULTI\r\n");
   }
 
+  var queuedCommands = new List<string[]>(transactionState.QueuedCommands);
+
   // Clear transaction state
   transactionState.InTransaction = false;
   transactionState.QueuedCommands.Clear();
-  
-  return Encoding.UTF8.GetBytes("*0\r\n");
+
+  if (queuedCommands.Count == 0)
+  {
+    return Encoding.UTF8.GetBytes("*0\r\n");
+  }
+
+  var responses = new List<byte[]>();
+
+  var tempTransactionState = new TransactionState();
+
+  foreach (var cmd in queuedCommands)
+  {
+    byte[] response = await ProcessCommand(cmd, storage, lists, streams, listWaiters, tempTransactionState);
+    responses.Add(response);
+  }
+
+  var result = new StringBuilder();
+  result.Append($"*{responses.Count}\r\n");
+
+
+  foreach (var response in responses)
+  {
+    result.Append(Encoding.UTF8.GetString(response));
+  }
+
+  return Encoding.UTF8.GetBytes(result.ToString());
 }
 
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
