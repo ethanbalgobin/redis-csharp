@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.ComponentModel.DataAnnotations;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using RedisServer;
 
@@ -75,6 +77,7 @@ static async Task<byte[]> ProcessCommand(
     "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
+    "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -133,6 +136,32 @@ static byte[] HandleGet(string key, ConcurrentDictionary<string, (string Value, 
   }
 
   return Encoding.UTF8.GetBytes($"${entry.Value.Length}\r\n{entry.Value}\r\n");
+}
+
+static byte[] HandleIncr(string key, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage)
+{
+  if (!storage.TryGetValue(key, out var entry))
+  {
+    storage[key] = ("1", null);
+    return Encoding.UTF8.GetBytes(":1\r\n");
+  }
+
+  if (entry.Expiry.HasValue && DateTime.UtcNow > entry.Expiry.Value)
+  {
+    storage.TryRemove(key, out _);
+    storage[key] = ("1", null);
+    return Encoding.UTF8.GetBytes(":1\r\n");
+  }
+
+  if (!int.TryParse(entry.Value, out int value))
+  {
+    return Encoding.UTF8.GetBytes("-ERR value is not an integer or out of range\r\n");
+  }
+
+  value++;
+  storage[key] = (value.ToString(), entry.Expiry);
+  
+  return Encoding.UTF8.GetBytes($":{value}\r\n");
 }
 
 static byte[] HandleRPush(string[] command, ConcurrentDictionary<string, List<string>> lists, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
