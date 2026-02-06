@@ -78,6 +78,7 @@ static async Task<byte[]> ProcessCommand(
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
     "SET" when command.Length >= 3 => HandleSet(command, storage),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
+    "MULTI" => HandleMulti(),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -617,7 +618,7 @@ static async Task<byte[]> HandleXReadAsync(
   for (int i = 0; i < numStreams; i++)
   {
     streamKeys.Add(command[streamsIndex + 1 + i]);
-    
+
     // Replace $ with the last ID in the stream
     string id = command[streamsIndex + 1 + numStreams + i];
     if (id == "$")
@@ -691,8 +692,8 @@ static async Task<byte[]> HandleXReadAsync(
       tasks.Add(tcs.Task);
     }
 
-    Task timeoutTask = blockTimeout > 0 
-      ? Task.Delay(blockTimeout) 
+    Task timeoutTask = blockTimeout > 0
+      ? Task.Delay(blockTimeout)
       : Task.Delay(Timeout.Infinite);
 
     tasks.Add(timeoutTask);
@@ -720,4 +721,9 @@ static async Task<byte[]> HandleXReadAsync(
 
     // loop again to collect results
   }
+}
+
+static byte[] HandleMulti()
+{
+  return Encoding.UTF8.GetBytes("+OK\r\n");
 }
