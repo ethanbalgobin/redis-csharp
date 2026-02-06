@@ -106,7 +106,7 @@ public static class RedisHelpers
 
     return System.Text.Encoding.UTF8.GetBytes(result.ToString());
   }
-  
+
   public static void NotifyStreamWaiters(string key, ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters)
   {
     if (!listWaiters.TryGetValue(key, out var waiters))
@@ -119,6 +119,27 @@ public static class RedisHelpers
         waiter.TrySetResult(key);
       }
       waiters.Clear();
+    }
+  }
+
+  public static string GetLastStreamId(
+    ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+    string key
+  )
+  {
+    if (!streams.TryGetValue(key, out var stream))
+    {
+      return "0-0";
+    }
+
+    lock (stream)
+    {
+      if (stream.Count == 0)
+      {
+        return "0-0";
+      }
+
+      return stream[stream.Count - 1].Id;
     }
   }
 }

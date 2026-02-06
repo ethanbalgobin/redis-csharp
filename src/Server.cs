@@ -588,9 +588,17 @@ static async Task<byte[]> HandleXReadAsync(
   for (int i = 0; i < numStreams; i++)
   {
     streamKeys.Add(command[streamsIndex + 1 + i]);
-    streamIds.Add(command[streamsIndex + 1 + numStreams + i]);
+    
+    // Replace $ with the last ID in the stream
+    string id = command[streamsIndex + 1 + numStreams + i];
+    if (id == "$")
+    {
+      id = RedisHelpers.GetLastStreamId(streams, streamKeys[i]);
+    }
+    streamIds.Add(id);
   }
 
+  // Try to get results immediately
   while (true)
   {
     var streamResults = new List<(string key, List<(string Id, Dictionary<string, string> Fields)> entries)>();
@@ -624,16 +632,19 @@ static async Task<byte[]> HandleXReadAsync(
       }
     }
 
+    // If we have results, return them
     if (streamResults.Count > 0)
     {
       return RedisHelpers.BuildXReadResponse(streamResults);
     }
 
+    // If not blocking, return null array
     if (blockTimeout == -1)
     {
       return Encoding.UTF8.GetBytes("*-1\r\n");
     }
 
+    // Block and wait for new entries
     var tasks = new List<Task>();
     var tcsList = new List<TaskCompletionSource<string?>>();
 
@@ -651,14 +662,15 @@ static async Task<byte[]> HandleXReadAsync(
       tasks.Add(tcs.Task);
     }
 
-    Task timeoutTask = blockTimeout > 0
-      ? Task.Delay(blockTimeout)
+    Task timeoutTask = blockTimeout > 0 
+      ? Task.Delay(blockTimeout) 
       : Task.Delay(Timeout.Infinite);
 
     tasks.Add(timeoutTask);
 
     var completedTask = await Task.WhenAny(tasks);
 
+    // Clean up all waiters
     for (int i = 0; i < streamKeys.Count; i++)
     {
       var key = streamKeys[i];
@@ -671,10 +683,12 @@ static async Task<byte[]> HandleXReadAsync(
       }
     }
 
+    // If timeout, return null
     if (completedTask == timeoutTask)
     {
       return Encoding.UTF8.GetBytes("*-1\r\n");
     }
+
+    // loop again to collect results
   }
 }
-
