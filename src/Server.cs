@@ -64,7 +64,7 @@ static async Task MainAsync(string[] args)
 
 /// <summary>
 /// Initiates the replication handshake with the master server.
-/// Sends PING, then two REPLCONF commands (listening-port and capa).
+/// Sends PING, then two REPLCONF commands (listening-port and capa) and PSYNC.
 /// </summary>
 /// /// <param name="config">Server configurtion containing master host and port</param>
 static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
@@ -105,6 +105,14 @@ static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
     bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
     string replconfCapaResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
+    // Send PSYNC ? -1
+    string psyncCommand = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+    byte[] psyncBytes = Encoding.UTF8.GetBytes(psyncCommand);
+    await stream.WriteAsync(psyncBytes, 0, psyncBytes.Length);
+
+    // Read PSYNC response (expecting +FULLRESYNC <REPL_ID> 0\r\n)
+    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+    string psyncResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
   }
   catch (Exception ex)
   {
