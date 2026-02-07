@@ -49,7 +49,7 @@ static async Task MainAsync(string[] args)
   // If this is a replica, initiate handshake with master
   if (config.IsReplica && config.MasterHost != null)
   {
-    _ = InitiateReplicationHandshakeAsync(config);
+    _ = InitiateReplicationHandshakeAsync(config, storage, lists, streams);
   }
 
   TcpListener server = new TcpListener(IPAddress.Any, config.Port);
@@ -65,9 +65,17 @@ static async Task MainAsync(string[] args)
 /// <summary>
 /// Initiates the replication handshake with the master server.
 /// Sends PING, then two REPLCONF commands (listening-port and capa) and PSYNC.
+/// After handshake, reads RDB file and starts listening for propagated commands.
 /// </summary>
-/// /// <param name="config">Server configurtion containing master host and port</param>
-static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
+/// <param name="config">Server configuration containing master host and port</param>
+/// <param name="storage">Key-value storage for strings</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+static async Task InitiateReplicationHandshakeAsync(
+  ServerConfig config,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
   try
   {
@@ -111,8 +119,25 @@ static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
     await stream.WriteAsync(psyncBytes, 0, psyncBytes.Length);
 
     // Read PSYNC response (expecting +FULLRESYNC <REPL_ID> 0\r\n)
+    // The response might also contain the start of the RDB file
     bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
     string psyncResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+    // Find where the PSYNC response ends
+    int psyncEndIdx = psyncResponse.IndexOf("\r\n");
+    if (psyncEndIdx >= 0)
+    {
+      // Extract any remaining data after the PSYNC response
+      int remainingStart = psyncEndIdx + 2;
+      byte[] remainingData = new byte[bytesRead - remainingStart];
+      Array.Copy(buffer, remainingStart, remainingData, 0, remainingData.Length);
+
+      // Read and discard the RDB file, passing any already-read data
+      byte[] extraData = await ReadRdbFileAsync(stream, buffer, remainingData);
+
+      // Start listening for propagated commands from master, passing any extra data
+      await ListenForPropagatedCommandsAsync(stream, config, storage, lists, streams, extraData);
+    }
   }
   catch (Exception ex)
   {
@@ -1116,8 +1141,8 @@ static async Task<byte[]> HandleXReadAsync(
       tasks.Add(tcs.Task);
     }
 
-    Task timeoutTask = blockTimeout > 0 
-      ? Task.Delay(blockTimeout) 
+    Task timeoutTask = blockTimeout > 0
+      ? Task.Delay(blockTimeout)
       : Task.Delay(Timeout.Infinite);
 
     tasks.Add(timeoutTask);
@@ -1141,4 +1166,308 @@ static async Task<byte[]> HandleXReadAsync(
       return Encoding.UTF8.GetBytes("*-1\r\n");
     }
   }
+  
 }
+
+/// <summary>
+/// Reads and discards the RDB file sent by master during full resynchronization.
+/// The RDB file is sent in format: $<length>\r\n<binary_contents>
+/// </summary>
+/// <param name="stream">Network stream to read from</param>
+/// <param name="buffer">Buffer for reading data</param>
+/// <param name="initialData">Data already read from previous buffer</param>
+/// <returns>Any extra data read beyond the RDB file</returns>
+static async Task<byte[]> ReadRdbFileAsync(NetworkStream stream, byte[] buffer, byte[] initialData)
+{
+  var rdbData = new List<byte>(initialData);
+
+  // read until we have the full RDB header ($<length>\r\n)
+  while (true)
+  {
+    string headerStr = Encoding.UTF8.GetString(rdbData.ToArray());
+    if (headerStr.Contains("\r\n"))
+    {
+      // Parse the length from $<length>\r\n
+      int dollarIdx = headerStr.IndexOf('$');
+      int crlfIdx = headerStr.IndexOf("\r\n");
+
+      if (dollarIdx >= 0 && crlfIdx > dollarIdx)
+      {
+        string lengthStr = headerStr.Substring(dollarIdx + 1, crlfIdx - dollarIdx - 1);
+        if (int.TryParse(lengthStr, out int rdbLength))
+        {
+          int headerLength = crlfIdx + 2; // Include \r\n
+          // Calculate how many RDB bytes we've already read
+          int rdbBytesAlreadyRead = rdbData.Count - headerLength;
+
+          // Total bytes needed (header + RDB content)
+          int totalBytesNeeded = headerLength + rdbLength;
+
+          // Read remaining RDB bytes
+          while (rdbData.Count < totalBytesNeeded)
+          {
+            int remaining = totalBytesNeeded - rdbData.Count;
+            int toRead = Math.Min(remaining, buffer.Length);
+
+            int bytesRead = await stream.ReadAsync(buffer, 0, toRead);
+            if (bytesRead == 0)
+              return new byte[0];
+
+            for (int i = 0; i < bytesRead; i++)
+            {
+              rdbData.Add(buffer[i]);
+            }
+          }
+
+          // RDB file fully received, extract any extra data beyond it
+          if (rdbData.Count > totalBytesNeeded)
+          {
+            int extraCount = rdbData.Count - totalBytesNeeded;
+            byte[] extraData = new byte[extraCount];
+            rdbData.CopyTo(totalBytesNeeded, extraData, 0, extraCount);
+            return extraData;
+          }
+
+          return new byte[0];
+        }
+      }
+    }
+
+    // Need more data
+    int read = await stream.ReadAsync(buffer, 0, buffer.Length);
+    if (read == 0)
+      return new byte[0];
+
+    for (int i = 0; i < read; i++)
+    {
+      rdbData.Add(buffer[i]);
+    }
+  }
+}
+
+/// <summary>
+/// Listens for propagated commands from master and executes them on replica's local storage.
+/// Commands are received as RESP arrays and executed without sending responses.
+/// </summary>
+/// <param name="masterStream">Network stream connected to master</param>
+/// <param name="config">Server configuration</param>
+/// <param name="storage">Key-value storage for strings</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+/// <param name="initialData">Data already read that may contain commands</param>
+static async Task ListenForPropagatedCommandsAsync(
+  NetworkStream masterStream,
+  ServerConfig config,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  byte[] initialData)
+{
+  var buffer = new byte[4096];
+  var incompleteData = new StringBuilder();
+
+  // Process any initial data first
+  if (initialData.Length > 0)
+  {
+    string data = Encoding.UTF8.GetString(initialData);
+    incompleteData.Append(data);
+    ProcessReplicaCommands(incompleteData, storage, lists, streams);
+  }
+
+  try
+  {
+    while (true)
+    {
+      int bytesRead = await masterStream.ReadAsync(buffer, 0, buffer.Length);
+      if (bytesRead == 0)
+        break;
+
+      string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+      incompleteData.Append(data);
+
+      ProcessReplicaCommands(incompleteData, storage, lists, streams);
+    }
+  }
+  catch (Exception ex)
+  {
+    Console.WriteLine($"Error processing propagated commands: {ex.Message}");
+  }
+}
+
+/// <summary>
+/// Tries to parse a complete RESP command from the buffer.
+/// Returns the parsed command and the end position, or null if incomplete.
+/// </summary>
+/// <param name="data">String data containing RESP protocol</param>
+/// <param name="startPos">Starting position in the data</param>
+/// <returns>Tuple of (parsed command array, end position) or (null, 0) if incomplete</returns>
+static (string[]? command, int endPos) TryParseRespCommand(string data, int startPos)
+{
+  if (startPos >= data.Length || data[startPos] != '*')
+    return (null, 0);
+
+  // Find the first \r\n to get array length
+  int firstCrlf = data.IndexOf("\r\n", startPos);
+  if (firstCrlf == -1)
+    return (null, 0);
+
+  string arrayLengthStr = data.Substring(startPos + 1, firstCrlf - startPos - 1);
+  if (!int.TryParse(arrayLengthStr, out int arrayLength))
+    return (null, 0);
+
+  var result = new List<string>();
+  int pos = firstCrlf + 2; // Skip past \r\n
+  for (int i = 0; i < arrayLength; i++)
+  {
+    // Expect bulk string: $<length>\r\n<data>\r\n
+    if (pos >= data.Length || data[pos] != '$')
+      return (null, 0);
+
+    int bulkCrlf = data.IndexOf("\r\n", pos);
+    if (bulkCrlf == -1)
+      return (null, 0);
+
+    string bulkLengthStr = data.Substring(pos + 1, bulkCrlf - pos - 1);
+    if (!int.TryParse(bulkLengthStr, out int bulkLength))
+      return (null, 0);
+
+    pos = bulkCrlf + 2; // Skip past \r\n
+    // Check if we have enough data for the bulk string
+    if (pos + bulkLength + 2 > data.Length)
+      return (null, 0);
+
+    string value = data.Substring(pos, bulkLength);
+    result.Add(value);
+
+    pos += bulkLength + 2; // Skip past data and \r\n
+  }
+
+  return (result.ToArray(), pos);
+}
+
+/// <summary>
+/// Processes complete RESP commands from the buffer, executing them on the replica.
+/// Removes processed commands from the buffer.
+/// </summary>
+/// <param name="incompleteData">StringBuilder containing buffered RESP data</param>
+/// <param name="storage">Key-value storage for strings</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+static void ProcessReplicaCommands(
+  StringBuilder incompleteData,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+{
+  string data = incompleteData.ToString();
+  int pos = 0;
+
+  while (pos < data.Length)
+  {
+    var (command, endPos) = TryParseRespCommand(data, pos);
+
+    if (command == null)
+    {
+      // Incomplete command, keep remaining data in buffer
+      incompleteData.Clear();
+      if (pos < data.Length)
+      {
+        incompleteData.Append(data.Substring(pos));
+      }
+      return;
+    }
+
+    // Execute the command on replica's local storage, without sending response
+    ExecuteReplicaCommand(command, storage, lists, streams);
+
+    pos = endPos;
+  }
+
+  // All data processed
+  incompleteData.Clear();
+}
+
+/// <summary>
+/// Executes a command received from master on the replica's local storage.
+/// Does NOT send any response (replicas don't respond to propagated commands).
+/// </summary>
+/// <param name="command">Parsed command array</param>
+/// <param name="storage">Key-value storage for strings</param>
+/// <param name="lists">Storage for Redis lists</param>
+/// <param name="streams">Storage for Redis streams</param>
+static void ExecuteReplicaCommand(
+  string[] command,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
+  ConcurrentDictionary<string, List<string>> lists,
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+{
+  if (command.Length == 0)
+    return;
+
+  string cmd = command[0].ToUpper();
+
+  switch (cmd)
+  {
+    case "SET" when command.Length >= 3:
+      {
+        string key = command[1];
+        string value = command[2];
+        DateTime? expiry = null;
+
+        // Handle PX option
+        if (command.Length >= 5 && command[3].ToUpper() == "PX")
+        {
+          if (int.TryParse(command[4], out int milliseconds))
+          {
+            expiry = DateTime.UtcNow.AddMilliseconds(milliseconds);
+          }
+        }
+        // Handle EX option
+        else if (command.Length >= 5 && command[3].ToUpper() == "EX")
+        {
+          if (int.TryParse(command[4], out int seconds))
+          {
+            expiry = DateTime.UtcNow.AddSeconds(seconds);
+          }
+        }
+
+        storage[key] = (value, expiry);
+        break;
+      }
+
+    case "DEL" when command.Length >= 2:
+      {
+        for (int i = 1; i < command.Length; i++)
+        {
+          storage.TryRemove(command[i], out _);
+        }
+        break;
+      }
+
+    case "XADD" when command.Length >= 4:
+      {
+        string key = command[1];
+        string id = command[2];
+
+        var fields = new Dictionary<string, string>();
+        for (int i = 3; i < command.Length; i += 2)
+        {
+          if (i + 1 < command.Length)
+          {
+            fields[command[i]] = command[i + 1];
+          }
+        }
+
+        var stream = streams.GetOrAdd(key, _ => new List<(string, Dictionary<string, string>)>());
+        lock (stream)
+        {
+          stream.Add((id, fields));
+        }
+        break;
+      }
+    default:
+      // Ignore unknown commands
+      break;
+  }
+}
+
