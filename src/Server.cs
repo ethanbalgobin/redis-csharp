@@ -145,6 +145,7 @@ static async Task HandleClientAsync(
   var stream = client.GetStream();
   var buffer = new byte[1024];
   var transactionState = new TransactionState();
+  bool isReplicaConnection = false;
 
   try
   {
@@ -163,12 +164,28 @@ static async Task HandleClientAsync(
       if (command.Length > 0 && command[0].ToUpper() == "PSYNC")
       {
         await SendEmptyRdbFileAsync(stream, ct);
+
+        lock (config.ReplicaStreams)
+        {
+          config.ReplicaStreams.Add(stream);
+        }
+        isReplicaConnection = true;
       }
     }
   }
   catch
   {
     // Handle exceptions silently
+  }
+  finally
+  {
+    if (isReplicaConnection)
+    {
+      lock (config.ReplicaStreams)
+      {
+        config.ReplicaStreams.Remove(stream);
+      }
+    }
   }
 }
 
@@ -234,7 +251,7 @@ static async Task<byte[]> ProcessCommand(
     "LPOP" when command.Length >= 2 => HandleLPop(command, lists),
     "LLEN" when command.Length == 2 => HandleLLen(command, lists),
     "GET" when command.Length >= 2 => HandleGet(command[1], storage),
-    "SET" when command.Length >= 3 => HandleSet(command, storage),
+    "SET" when command.Length >= 3 => HandleSet(command, storage, config),
     "INCR" when command.Length >= 2 => HandleIncr(command[1], storage),
     "MULTI" => HandleMulti(transactionState),
     "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState, config),
@@ -279,7 +296,7 @@ static byte[] HandleEcho(string message)
 /// <param name="command">Command array (SET key value [EX seconds | PX milliseconds])</param>
 /// <param name="storage">Key-value storage</param>
 /// <returns>OK response as a simple string</returns>
-static byte[] HandleSet(string[] command, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage)
+static byte[] HandleSet(string[] command, ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, ServerConfig config)
 {
   string key = command[1];
   string value = command[2];
@@ -300,6 +317,12 @@ static byte[] HandleSet(string[] command, ConcurrentDictionary<string, (string V
   }
 
   storage[key] = (value, expiry);
+
+  if (!config.IsReplica)
+  {
+    RedisHelpers.PropagateCommandToReplicas(command, config);
+  }
+
   return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 

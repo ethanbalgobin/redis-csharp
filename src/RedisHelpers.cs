@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 
 namespace RedisServer;
 
@@ -183,6 +184,44 @@ public static class RedisHelpers
         return "0-0";
 
       return stream[stream.Count - 1].Id;
+    }
+  }
+
+/// <summary>
+/// Propagates a write command to all connected replicas.
+/// Commands are sent as RESP arrays over the replication connection.
+/// </summary>
+/// <param name="command">Command array to propagate</param>
+/// <param name="config">Server configuration containing replica streams</param>
+  public static void PropagateCommandToReplicas(string[] command, ServerConfig config)
+  {
+    if (config.ReplicaStreams.Count == 0)
+      return;
+
+    var sb = new StringBuilder();
+    sb.Append($"*{command.Length}\r\n");
+
+    foreach (var arg in command)
+    {
+      sb.Append($"${arg.Length}\r\n{arg}\r\n");
+    }
+
+    byte[] commandBytes = Encoding.UTF8.GetBytes(sb.ToString());
+
+    lock (config.ReplicaStreams)
+    {
+      foreach (var replicaStream in config.ReplicaStreams.ToList())
+      {
+        try
+        {
+          replicaStream.Write(commandBytes, 0, commandBytes.Length);
+          replicaStream.Flush();
+        }
+        catch
+        {
+          // if write fails, replica is disconnected, it will be removed in the finally block
+        }
+      }
     }
   }
 }
