@@ -212,6 +212,7 @@ static async Task<byte[]> ProcessCommand(
     "EXEC" => await HandleExecAsync(command, storage, lists, streams, listWaiters, transactionState, config),
     "DISCARD" => HandleDiscard(transactionState),
     "INFO" => HandleInfo(command, config),
+    "REPLCONF" => HandleReplconf(command),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -440,6 +441,17 @@ static byte[] HandleInfo(string[] command, ServerConfig config)
   }
 
   return Encoding.UTF8.GetBytes("$-1\r\n");
+}
+
+/// <summary>
+/// Handles the REPLCONF command from a replica during replication handshake.
+/// Accepts listening-port and capa arguments and responds with OK. 
+/// </summary>
+/// <param name="Command">Command array (REPLCONF [listening-port PORT | capa CAPABILITY])</param>
+/// <returns>OK response as a simple string</returns>
+static byte[] HandleReplconf(string[] command)
+{
+  return Encoding.UTF8.GetBytes("+OK\r\n");
 }
 
 /// <summary>
