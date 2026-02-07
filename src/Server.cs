@@ -64,7 +64,7 @@ static async Task MainAsync(string[] args)
 
 /// <summary>
 /// Initiates the replication handshake with the master server.
-/// Sends PING as the first step of the handshake.
+/// Sends PING, then two REPLCONF commands (listening-port and capa).
 /// </summary>
 /// /// <param name="config">Server configurtion containing master host and port</param>
 static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
@@ -85,6 +85,26 @@ static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
     var buffer = new byte[1024];
     int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
     string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+    // Send REPLCONF listening-port <PORT>
+    string portString = config.Port.ToString();
+    string replconfPort = $"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${portString.Length}\r\n{portString}\r\n";
+    byte[] replconfPortBytes = Encoding.UTF8.GetBytes(replconfPort);
+    await stream.WriteAsync(replconfPortBytes, 0, replconfPortBytes.Length);
+
+    // Read REPLCONF listening-port response (expecting +OK\r\n)
+    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+    string replconfPortResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+    // Send REPLCONF capa psync2
+    string replconfCapa = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+    byte[] replconfCapaBytes = Encoding.UTF8.GetBytes(replconfCapa);
+    await stream.WriteAsync(replconfCapaBytes, 0, replconfCapaBytes.Length);
+
+    // Read REPLCONF capa response (expecting +OK\r\n)
+    bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+    string replconfCapaResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
   }
   catch (Exception ex)
   {
