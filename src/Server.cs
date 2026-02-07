@@ -213,6 +213,7 @@ static async Task<byte[]> ProcessCommand(
     "DISCARD" => HandleDiscard(transactionState),
     "INFO" => HandleInfo(command, config),
     "REPLCONF" => HandleReplconf(command),
+    "PSYNC" => HandlePsync(command),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -452,6 +453,21 @@ static byte[] HandleInfo(string[] command, ServerConfig config)
 static byte[] HandleReplconf(string[] command)
 {
   return Encoding.UTF8.GetBytes("+OK\r\n");
+}
+
+/// <summary>
+/// Handles the PSYNC command from a replica during replication handshake.
+/// Responds with FULLRESYNC containing the master's replication ID and offset.
+/// </summary>
+/// <param name="command">Command array (PSYNC replication_id offset)</param>
+/// <returns>FULLRESYNC response as a simple string</returns>
+static byte[] HandlePsync(string[] command)
+{
+  string replId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+  int offset = 0;
+
+  string response = $"+FULLRESYNC {replId} {offset}\r\n";
+  return Encoding.UTF8.GetBytes(response);
 }
 
 /// <summary>
