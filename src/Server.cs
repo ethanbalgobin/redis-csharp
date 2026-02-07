@@ -123,6 +123,7 @@ static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
 
 /// <summary>
 /// Handles a single client connection, reading commands and sending responses.
+/// Detects PSYNC command to send RDB file for replication.
 /// </summary>
 /// <param name="client">The TCP client connection</param>
 /// <param name="storage">Key-value storage for strings with optional expiry</param>
@@ -157,12 +158,39 @@ static async Task HandleClientAsync(
 
       byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters, transactionState, config);
       await stream.WriteAsync(response, 0, response.Length, ct);
+
+      // if this was a PSYNC command, send the RDB file
+      if (command.Length > 0 && command[0].ToUpper() == "PSYNC")
+      {
+        await SendEmptyRdbFileAsync(stream, ct);
+      }
     }
   }
   catch
   {
     // Handle exceptions silently
   }
+}
+
+/// <summary>
+/// Sends an empty RDB file to a replica during full resynchronization.
+/// The file is sent in the format: $<length>\r\n<binary_contents>
+/// </summary>
+/// <param name="stream">Network stream to write to</param>
+/// <param name="ct">Cancellation token</param> 
+static async Task SendEmptyRdbFileAsync(NetworkStream stream, CancellationToken ct)
+{
+  // Empty RDB file in hex format
+  string emptyRdbHex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+
+  // Convert hex string to byte array
+  byte[] rdbBytes = Convert.FromHexString(emptyRdbHex);
+
+  string header = $"${rdbBytes.Length}\r\n";
+  byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+
+  await stream.WriteAsync(headerBytes, 0, headerBytes.Length, ct);
+  await stream.WriteAsync(rdbBytes, 0, rdbBytes.Length, ct);
 }
 
 /// <summary>
@@ -178,8 +206,8 @@ static async Task HandleClientAsync(
 /// <param name="config">Server configuration</param>
 /// <returns>RESP-encoded response bytes</returns>
 static async Task<byte[]> ProcessCommand(
-  string[] command, 
-  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage, 
+  string[] command,
+  ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
   ConcurrentDictionary<string, List<TaskCompletionSource<string?>>> listWaiters,
