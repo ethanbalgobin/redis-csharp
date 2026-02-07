@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -20,7 +21,7 @@ static async Task MainAsync(string[] args)
 
   // Parse command-line arguments
   var config = new ServerConfig();
-  
+
   for (int i = 0; i < args.Length; i++)
   {
     if (args[i] == "--port" && i + 1 < args.Length)
@@ -45,15 +46,52 @@ static async Task MainAsync(string[] args)
     }
   }
 
+  // If this is a replica, initiate handshake with master
+  if (config.IsReplica && config.MasterHost != null)
+  {
+    _ = InitiateReplicationHandshakeAsync(config);
+  }
+
   TcpListener server = new TcpListener(IPAddress.Any, config.Port);
   server.Start();
-  
+
   while (true)
   {
     var client = await server.AcceptTcpClientAsync();
     _ = HandleClientAsync(client, storage, lists, streams, listWaiters, config, CancellationToken.None);
   }
 }
+
+/// <summary>
+/// Initiates the replication handshake with the master server.
+/// Sends PING as the first step of the handshake.
+/// </summary>
+/// /// <param name="config">Server configurtion containing master host and port</param>
+static async Task InitiateReplicationHandshakeAsync(ServerConfig config)
+{
+  try
+  {
+    var client = new TcpClient();
+    await client.ConnectAsync(config.MasterHost!, config.MasterPort);
+
+    var stream = client.GetStream();
+
+    // Send ping as RESP encoded array
+    string pingCommand = "*1\r\n$4\r\nPING\r\n";
+    byte[] pingBytes = Encoding.UTF8.GetBytes(pingCommand);
+    await stream.WriteAsync(pingBytes, 0, pingBytes.Length);
+
+    // Read response
+    var buffer = new byte[1024];
+    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+    string response = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+  }
+  catch (Exception ex)
+  {
+    Console.WriteLine($"Replication handshake failed: {ex.Message}");
+  }
+}
+
 
 /// <summary>
 /// Handles a single client connection, reading commands and sending responses.
@@ -88,7 +126,7 @@ static async Task HandleClientAsync(
 
       string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       var command = RedisHelpers.ParseRespArray(request);
-      
+
       byte[] response = await ProcessCommand(command, storage, lists, streams, listWaiters, transactionState, config);
       await stream.WriteAsync(response, 0, response.Length, ct);
     }
