@@ -136,7 +136,7 @@ static async Task InitiateReplicationHandshakeAsync(
       byte[] extraData = await ReadRdbFileAsync(stream, buffer, remainingData);
 
       // Start listening for propagated commands from master, passing any extra data
-      await ListenForPropagatedCommandsAsync(stream, config, storage, lists, streams, extraData);
+      await ListenForPropagatedCommandsAsync(stream, extraData, config, storage, lists, streams);
     }
   }
   catch (Exception ex)
@@ -1257,21 +1257,22 @@ static async Task<byte[]> ReadRdbFileAsync(NetworkStream stream, byte[] buffer, 
 /// <param name="initialData">Data already read that may contain commands</param>
 static async Task ListenForPropagatedCommandsAsync(
   NetworkStream masterStream,
+  byte[] initialData,
   ServerConfig config,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
-  byte[] initialData)
-{
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams
+  ) {
   var buffer = new byte[4096];
   var incompleteData = new StringBuilder();
+  var replicationOffset = new ReplicationOffset { Value = 0 };
 
   // Process any initial data first
   if (initialData.Length > 0)
   {
     string data = Encoding.UTF8.GetString(initialData);
     incompleteData.Append(data);
-    await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams);
+    await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams, replicationOffset);
   }
 
   try
@@ -1285,7 +1286,7 @@ static async Task ListenForPropagatedCommandsAsync(
       string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       incompleteData.Append(data);
 
-      await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams);
+      await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams, replicationOffset);
     }
   }
   catch (Exception ex)
@@ -1358,7 +1359,9 @@ static async Task ProcessReplicaCommands(
   NetworkStream masterStream,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  ReplicationOffset replicationOffset
+  )
 {
   string data = buffer.ToString();
   int position = 0;
@@ -1370,12 +1373,21 @@ static async Task ProcessReplicaCommands(
       position++;
       continue;
     }
+    int commandStart = position;
     var (command, endPosition) = TryParseRespCommand(data, position);
 
     if (command == null)
       break; // incomplete command
 
-    string? response = ExecuteReplicaCommand(command, storage, lists, streams);
+    int commandByteLength = endPosition - commandStart;
+
+
+    bool isGetAck = command.Length >= 2 && 
+                    command[0].ToUpper() == "REPLCONF" && 
+                    command[1].ToUpper() == "GETACK";
+
+    // Process command and get response if needed
+    string? response = ExecuteReplicaCommand(command, storage, lists, streams, replicationOffset.Value);
 
     if (response != null)
     {
@@ -1383,6 +1395,8 @@ static async Task ProcessReplicaCommands(
       await masterStream.WriteAsync(responseBytes, 0, responseBytes.Length);
       await masterStream.FlushAsync();
     }
+
+    replicationOffset.Value += commandByteLength;
 
     position = endPosition;
   }
@@ -1406,7 +1420,8 @@ static string? ExecuteReplicaCommand(
   string[] command,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
-  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
+  ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams,
+  long currentOffset)
 {
   if (command.Length == 0)
     return null;
@@ -1417,8 +1432,10 @@ static string? ExecuteReplicaCommand(
   {
     case "REPLCONF" when command.Length >= 2 && command[1].ToUpper() == "GETACK":
       {
-        // Response with REPLCONF ACK <offset> which is set to 0 for now
-        return "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n";
+        // Response with REPLCONF ACK <offset> 
+        // use the offset before this command was processed
+        string offsetStr = currentOffset.ToString();
+        return $"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${offsetStr.Length}\r\n{offsetStr}\r\n";
       }
     case "SET" when command.Length >= 3:
       {
@@ -1477,6 +1494,10 @@ static string? ExecuteReplicaCommand(
         }
         break;
       }
+
+    case "PING":
+      break;
+
     default:
       // Ignore unknown commands
       break;
