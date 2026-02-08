@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -285,7 +286,7 @@ static async Task<byte[]> ProcessCommand(
     "INFO" => HandleInfo(command, config),
     "REPLCONF" => HandleReplconf(command),
     "PSYNC" => HandlePsync(command),
-    "WAIT" when command.Length >= 3 => HandleWait(command, config),
+    "WAIT" when command.Length >= 3 => HandleWait(config),
     "RPUSH" when command.Length >= 3 => HandleRPush(command, lists, listWaiters),
     "LPUSH" when command.Length >= 3 => HandleLPush(command, lists, listWaiters),
     "LRANGE" when command.Length >= 4 => HandleLRange(command, lists),
@@ -1510,29 +1511,19 @@ static string? ExecuteReplicaCommand(
 
 /// <summary>
 /// Handles the WAIT command, checking how many replicas have acknowledged all previous write commands.
+/// When no write commands are sent, return the number of connected replicas since they are all in sync at offset 0
 /// </summary>
 /// <param name="command">Command array (WAIT numreplicas timeout)</param>
 /// <param name="config">Server configuration containing replica connections</param>
 /// <returns>Number of replicas that acknowledged, as a RESP integer</returns>
-static byte[] HandleWait(string[] command, ServerConfig config)
+static byte[] HandleWait(ServerConfig config)
 {
-  int numReplicas = 0;
-  int timeout = 0;
-
-  if (command.Length >= 2)
-    int.TryParse(command[1], out numReplicas);
-
-  if (command.Length >= 3)
-    int.TryParse(command[2], out timeout);
-
   int connectedReplicas = 0;
   lock (config.ReplicaStreams)
   {
     connectedReplicas = config.ReplicaStreams.Count;
   }
 
-  int result = Math.Min(numReplicas, connectedReplicas);
-
-  return Encoding.UTF8.GetBytes($":{result}\r\n");
+  return Encoding.UTF8.GetBytes($":{connectedReplicas}\r\n");
 }
 
