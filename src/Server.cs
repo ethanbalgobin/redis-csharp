@@ -1271,7 +1271,7 @@ static async Task ListenForPropagatedCommandsAsync(
   {
     string data = Encoding.UTF8.GetString(initialData);
     incompleteData.Append(data);
-    ProcessReplicaCommands(incompleteData, storage, lists, streams);
+    await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams);
   }
 
   try
@@ -1285,7 +1285,7 @@ static async Task ListenForPropagatedCommandsAsync(
       string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
       incompleteData.Append(data);
 
-      ProcessReplicaCommands(incompleteData, storage, lists, streams);
+      await ProcessReplicaCommands(incompleteData, masterStream, storage, lists, streams);
     }
   }
   catch (Exception ex)
@@ -1353,61 +1353,73 @@ static (string[]? command, int endPos) TryParseRespCommand(string data, int star
 /// <param name="storage">Key-value storage for strings</param>
 /// <param name="lists">Storage for Redis lists</param>
 /// <param name="streams">Storage for Redis streams</param>
-static void ProcessReplicaCommands(
-  StringBuilder incompleteData,
+static async Task ProcessReplicaCommands(
+  StringBuilder buffer,
+  NetworkStream masterStream,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
-  string data = incompleteData.ToString();
-  int pos = 0;
+  string data = buffer.ToString();
+  int position = 0;
 
-  while (pos < data.Length)
+  while (position < data.Length)
   {
-    var (command, endPos) = TryParseRespCommand(data, pos);
+    if (data[position] != '*')
+    {
+      position++;
+      continue;
+    }
+    var (command, endPosition) = TryParseRespCommand(data, position);
 
     if (command == null)
+      break; // incomplete command
+
+    string? response = ExecuteReplicaCommand(command, storage, lists, streams);
+
+    if (response != null)
     {
-      // Incomplete command, keep remaining data in buffer
-      incompleteData.Clear();
-      if (pos < data.Length)
-      {
-        incompleteData.Append(data.Substring(pos));
-      }
-      return;
+      byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+      await masterStream.WriteAsync(responseBytes, 0, responseBytes.Length);
+      await masterStream.FlushAsync();
     }
 
-    // Execute the command on replica's local storage, without sending response
-    ExecuteReplicaCommand(command, storage, lists, streams);
-
-    pos = endPos;
+    position = endPosition;
   }
 
-  // All data processed
-  incompleteData.Clear();
+  buffer.Clear();
+  if (position < data.Length)
+  {
+    buffer.Append(data.Substring(position));
+  }
 }
 
 /// <summary>
 /// Executes a command received from master on the replica's local storage.
-/// Does NOT send any response (replicas don't respond to propagated commands).
+/// Returns a response string if the command requires a response (REPLCONF GETACK), otherwise null.
 /// </summary>
 /// <param name="command">Parsed command array</param>
 /// <param name="storage">Key-value storage for strings</param>
 /// <param name="lists">Storage for Redis lists</param>
 /// <param name="streams">Storage for Redis streams</param>
-static void ExecuteReplicaCommand(
+static string? ExecuteReplicaCommand(
   string[] command,
   ConcurrentDictionary<string, (string Value, DateTime? Expiry)> storage,
   ConcurrentDictionary<string, List<string>> lists,
   ConcurrentDictionary<string, List<(string Id, Dictionary<string, string> Fields)>> streams)
 {
   if (command.Length == 0)
-    return;
+    return null;
 
   string cmd = command[0].ToUpper();
 
   switch (cmd)
   {
+    case "REPLCONF" when command.Length >= 2 && command[1].ToUpper() == "GETACK":
+      {
+        // Response with REPLCONF ACK <offset> which is set to 0 for now
+        return "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n";
+      }
     case "SET" when command.Length >= 3:
       {
         string key = command[1];
@@ -1469,5 +1481,7 @@ static void ExecuteReplicaCommand(
       // Ignore unknown commands
       break;
   }
+
+  return null;
 }
 
